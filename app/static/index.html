@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 问答中转站 · 监控</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1420; color: #d5dbe7; font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 16px 24px 48px; }
+  h1 { font-size: 18px; margin-bottom: 12px; }
+  h2 { font-size: 15px; margin: 20px 0 10px; color: #9aa5bb; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .dot.green { background: #3ecf6e; } .dot.yellow { background: #f0b429; }
+  .dot.red { background: #ef4d4d; } .dot.gray { background: #6b7383; }
+
+  #banner { display: none; background: #5a1f1f; border: 1px solid #ef4d4d; color: #ffb4b4;
+            padding: 8px 14px; border-radius: 8px; margin-bottom: 12px; }
+
+  #healthbar { display: flex; gap: 18px; align-items: center; background: #171e2e;
+               border: 1px solid #263048; border-radius: 10px; padding: 10px 16px; flex-wrap: wrap; }
+  #healthbar .item { white-space: nowrap; }
+
+  /* 创建任务面板 */
+  #create { background: #171e2e; border: 1px solid #263048; border-radius: 10px; padding: 12px 14px; }
+  #create textarea { width: 100%; min-height: 90px; resize: vertical; background: #0b101b; color: #d5dbe7;
+                     border: 1px solid #2b3650; border-radius: 8px; padding: 8px 10px; font: inherit; }
+  #create textarea:focus { outline: none; border-color: #3d5a99; }
+  #create .bar { display: flex; gap: 10px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  #create select { background: #0b101b; color: #d5dbe7; border: 1px solid #2b3650; border-radius: 8px;
+                   padding: 5px 10px; font: inherit; }
+  #create button { background: #2456c4; color: #fff; border: none; border-radius: 8px;
+                   padding: 6px 18px; font: inherit; cursor: pointer; }
+  #create button:hover { background: #2f66dd; }
+  #create button:disabled { background: #3a4152; cursor: not-allowed; }
+  #char-count { color: #5d6678; font-size: 12.5px; }
+  #submit-msg { font-size: 13px; }
+  #submit-msg.err { color: #ff8f8f; }
+  #submit-msg.ok { color: #56d987; }
+
+  /* 调试提交追踪卡片 */
+  #submissions { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .sub { background: #171e2e; border: 1px solid #263048; border-radius: 10px; padding: 12px 14px; }
+  .sub .head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .sub .close { margin-left: auto; color: #5d6678; cursor: pointer; border: none; background: none; font-size: 15px; }
+  .sub .close:hover { color: #ff8f8f; }
+  .sub .meta { color: #9aa5bb; font-size: 13px; }
+
+  #workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .card { background: #171e2e; border: 1px solid #263048; border-radius: 10px; padding: 12px 14px; }
+  .card .title { font-weight: 600; margin-bottom: 4px; }
+  .card .meta { color: #9aa5bb; font-size: 13px; }
+  .card .detail { color: #ef9a9a; font-size: 13px; margin-top: 4px; }
+  .card .counts { margin-top: 6px; font-size: 13px; color: #9aa5bb; }
+
+  table { width: 100%; border-collapse: collapse; background: #171e2e; border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #232c42; vertical-align: top; }
+  th { color: #9aa5bb; font-weight: 500; font-size: 13px; }
+  tr.row { cursor: pointer; } tr.row:hover { background: #1d2639; }
+  tr.exp { display: none; } tr.exp.open { display: table-row; }
+  pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto;
+        background: #0b101b; border-radius: 8px; padding: 10px 12px; margin: 4px 0; font-size: 13px; }
+
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 10px; font-size: 12px; }
+  .badge.queued { background: #3a4152; color: #c8cfdd; }
+  .badge.running { background: #1d3a6e; color: #7db3ff; }
+  .badge.done { background: #14402a; color: #56d987; }
+  .badge.failed { background: #4d1b1b; color: #ff8f8f; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .empty { color: #5d6678; padding: 10px 2px; }
+  #pager { display: flex; gap: 10px; align-items: center; margin-top: 10px; color: #9aa5bb; font-size: 13px; }
+  #pager button { background: #171e2e; color: #d5dbe7; border: 1px solid #2b3650; border-radius: 6px;
+                  padding: 4px 14px; font: inherit; cursor: pointer; }
+  #pager button:hover:not(:disabled) { border-color: #3d5a99; }
+  #pager button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .site-actual { color: #7db3ff; }
+</style>
+</head>
+<body>
+<h1>AI 问答中转站 · 监控</h1>
+<div id="banner">⚠ 服务不可达，正在重试…</div>
+
+<div id="healthbar">
+  <span class="item"><span id="daemon-dot" class="dot gray"></span>daemon：<span id="daemon-text">…</span></span>
+  <span class="item">worker：空闲 <b id="cnt-idle">0</b> / 忙碌 <b id="cnt-busy">0</b> / 异常 <b id="cnt-degraded">0</b></span>
+  <span class="item">队列长度：<b id="cnt-queue">0</b></span>
+</div>
+
+<h2>创建任务（调试）</h2>
+<div id="create">
+  <textarea id="prompt-input" maxlength="12000" placeholder="输入提示词，最长 12000 字符…"></textarea>
+  <div class="bar">
+    <select id="site-select">
+      <option value="">任意站点</option>
+      <option value="kimi">kimi</option>
+      <option value="deepseek">deepseek</option>
+    </select>
+    <button id="submit-btn">提交</button>
+    <span id="char-count">0 / 12000</span>
+    <span id="submit-msg"></span>
+  </div>
+</div>
+<div id="submissions" style="margin-top:12px"></div>
+
+<h2>Worker</h2>
+<div id="workers"></div>
+
+<h2>排队任务</h2>
+<div id="queued"><div class="empty">暂无排队任务</div></div>
+
+<h2>最近任务</h2>
+<table>
+  <thead><tr><th>任务</th><th>状态</th><th>站点</th><th>耗时</th><th>提示词</th></tr></thead>
+  <tbody id="recent"></tbody>
+</table>
+<div id="pager">
+  <button id="page-prev">上一页</button>
+  <span id="page-info">第 1 页</span>
+  <button id="page-next">下一页</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const short = id => (id || '').slice(0, 8);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const stateDot = s => ({idle:'green', busy:'yellow', degraded:'red', starting:'gray'}[s] || 'gray');
+const stateText = s => ({idle:'空闲', busy:'忙碌', degraded:'异常', starting:'启动中'}[s] || s);
+const siteText = s => s || '任意';
+const fmtSecs = s => s == null ? '-' : (s < 60 ? s.toFixed(0) + 's' : (s/60).toFixed(1) + 'min');
+
+// ---- 创建任务 ----
+
+const tracked = [];  // 本次页面会话提交的任务 id，最新在前，最多 5 个
+
+$('prompt-input').addEventListener('input', () => {
+  $('char-count').textContent = $('prompt-input').value.length + ' / 12000';
+});
+
+$('submit-btn').onclick = async () => {
+  const prompt = $('prompt-input').value.trim();
+  const site = $('site-select').value;
+  const msg = $('submit-msg');
+  if (!prompt) { msg.className = 'err'; msg.textContent = '提示词不能为空'; return; }
+  $('submit-btn').disabled = true;
+  msg.className = ''; msg.textContent = '提交中…';
+  try {
+    const r = await fetch('/api/tasks', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(site ? {prompt, site} : {prompt}),
+    });
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const d = await r.json();
+        detail = typeof d.detail === 'string' ? d.detail
+               : Array.isArray(d.detail) ? d.detail.map(x => x.msg).join('；')
+               : detail;
+      } catch (e) { /* 保留默认 */ }
+      throw new Error(r.status === 429 ? '队列已满，请稍后再试' : detail);
+    }
+    const {task_id} = await r.json();
+    tracked.unshift(task_id);
+    if (tracked.length > 5) tracked.pop();
+    tasksPage = 1;  // 新任务跳回第一页
+    msg.className = 'ok';
+    msg.textContent = '已提交 ' + short(task_id);
+    $('prompt-input').value = '';
+    $('char-count').textContent = '0 / 12000';
+    renderSubmissions();
+  } catch (e) {
+    msg.className = 'err';
+    msg.textContent = '提交失败：' + e.message;
+  } finally {
+    $('submit-btn').disabled = false;
+  }
+};
+
+async function renderSubmissions() {
+  if (!tracked.length) { $('submissions').innerHTML = ''; return; }
+  const items = await Promise.all(tracked.map(async id => {
+    try {
+      const r = await fetch('/api/tasks/' + id);
+      if (r.ok) return await r.json();
+      return {task_id: id, status: 'failed', error: '查询失败 HTTP ' + r.status};
+    } catch (e) {
+      return {task_id: id, status: 'failed', error: '查询失败：' + e.message};
+    }
+  }));
+  $('submissions').innerHTML = items.map(t => `
+    <div class="sub">
+      <div class="head">
+        <span class="mono">${short(t.task_id)}</span>
+        <span class="badge ${t.status}">${t.status}</span>
+        <button class="close" data-id="${esc(t.task_id)}" title="移除">×</button>
+      </div>
+      <div class="meta">站点：${siteText(t.site)}　耗时：${fmtSecs(t.elapsed_seconds)}</div>
+      ${t.status === 'done' ? `<pre>${esc(t.result || '')}</pre>` : ''}
+      ${t.status === 'failed' ? `<pre>${esc(t.error || '')}</pre>` : ''}
+    </div>`).join('');
+  document.querySelectorAll('.sub .close').forEach(btn => {
+    btn.onclick = () => {
+      const i = tracked.indexOf(btn.dataset.id);
+      if (i >= 0) tracked.splice(i, 1);
+      renderSubmissions();
+    };
+  });
+}
+
+// ---- 最近任务（SQLite 持久化分页，默认 20 条/页）----
+
+let tasksPage = 1;
+const TASKS_PAGE_SIZE = 20;
+// 站点列：优先显示实际执行站点，其次是请求偏好，最后"任意"
+const taskSite = t => t.actual_site || t.site || '任意';
+
+async function fetchTasks() {
+  try {
+    const r = await fetch(`/api/tasks?page=${tasksPage}&page_size=${TASKS_PAGE_SIZE}`);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const pages = Math.max(1, Math.ceil(data.total / TASKS_PAGE_SIZE));
+    if (tasksPage > pages) { tasksPage = pages; return fetchTasks(); }
+    renderTasks(data.items);
+    $('page-info').textContent = `第 ${tasksPage} / ${pages} 页 · 共 ${data.total} 条`;
+    $('page-prev').disabled = tasksPage <= 1;
+    $('page-next').disabled = tasksPage >= pages;
+  } catch (e) { /* 本次失败下轮自动重试 */ }
+}
+
+function renderTasks(items) {
+  $('recent').innerHTML = items.map(t => `
+    <tr class="row" data-id="${esc(t.task_id)}">
+      <td class="mono">${short(t.task_id)}</td>
+      <td><span class="badge ${t.status}">${t.status}</span></td>
+      <td class="${t.actual_site ? 'site-actual' : ''}">${esc(taskSite(t))}</td>
+      <td>${fmtSecs(t.elapsed_seconds)}</td>
+      <td>${esc(t.prompt_preview)}</td>
+    </tr>
+    <tr class="exp" id="exp-${esc(t.task_id)}"><td colspan="5">
+      <b>提示词</b><pre>${esc(t.prompt_preview)}</pre>
+      ${t.status === 'failed'
+        ? `<b>错误</b><pre>${esc(t.error || '')}</pre>`
+        : `<b>结果</b><pre>${esc(t.result_preview ?? '')}</pre>`}
+    </td></tr>`).join('') || '<tr><td colspan="5" class="empty">暂无任务</td></tr>';
+
+  document.querySelectorAll('tr.row').forEach(row => {
+    row.onclick = async () => {
+      const exp = $('exp-' + row.dataset.id);
+      if (!exp.classList.contains('open')) {
+        // 展开时拉取完整任务详情
+        try {
+          const r = await fetch('/api/tasks/' + row.dataset.id);
+          if (r.ok) {
+            const t = await r.json();
+            exp.querySelectorAll('pre')[0].textContent = t.prompt;
+            exp.querySelectorAll('pre')[1].textContent = t.status === 'failed' ? (t.error || '') : (t.result || '');
+          }
+        } catch (e) { /* 忽略，下次点击重试 */ }
+      }
+      exp.classList.toggle('open');
+    };
+  });
+}
+
+$('page-prev').onclick = () => { if (tasksPage > 1) { tasksPage--; fetchTasks(); } };
+$('page-next').onclick = () => { tasksPage++; fetchTasks(); };
+
+// ---- 监控刷新 ----
+
+async function refresh() {
+  let data;
+  try {
+    const r = await fetch('/api/stats');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    data = await r.json();
+    $('banner').style.display = 'none';
+  } catch (e) {
+    $('banner').style.display = 'block';
+    return;
+  }
+
+  // 健康条
+  $('daemon-dot').className = 'dot ' + (data.daemon_ok ? 'green' : 'red');
+  $('daemon-text').textContent = data.daemon_ok ? '正常' : (data.daemon_detail || '异常');
+  const cnt = {idle: 0, busy: 0, degraded: 0};
+  data.workers.forEach(w => { if (w.state in cnt) cnt[w.state]++; });
+  $('cnt-idle').textContent = cnt.idle;
+  $('cnt-busy').textContent = cnt.busy;
+  $('cnt-degraded').textContent = cnt.degraded;
+  $('cnt-queue').textContent = data.queue_size;
+
+  // 调试提交追踪（有未完结任务时才额外请求）
+  if (tracked.length) renderSubmissions();
+
+  // Worker 卡片
+  $('workers').innerHTML = data.workers.map(w => `
+    <div class="card">
+      <div class="title"><span class="dot ${stateDot(w.state)}"></span>${esc(w.worker_id)} · ${esc(w.site)}</div>
+      <div class="meta">模型：${esc(w.model || '默认')}　状态：${stateText(w.state)}</div>
+      <div class="meta">当前任务：<span class="mono">${w.current_task_id ? short(w.current_task_id) : '-'}</span></div>
+      ${w.detail ? `<div class="detail">${esc(w.detail)}</div>` : ''}
+      <div class="counts">完成 ${w.done_count} / 失败 ${w.fail_count}</div>
+    </div>`).join('') || '<div class="empty">无 worker</div>';
+
+  // 排队任务
+  const now = Date.now() / 1000;
+  $('queued').innerHTML = data.queued_tasks.length
+    ? '<table><thead><tr><th>任务</th><th>站点</th><th>已等待</th></tr></thead><tbody>' +
+      data.queued_tasks.map(t => `<tr><td class="mono">${short(t.task_id)}</td>
+        <td>${siteText(t.site)}</td><td>${fmtSecs(now - t.created_at)}</td></tr>`).join('') +
+      '</tbody></table>'
+    : '<div class="empty">暂无排队任务</div>';
+
+  // 最近任务（独立分页数据源）
+  fetchTasks();
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+server:
+  host: 127.0.0.1
+  port: 8600
+
+webbridge:
+  base_url: http://127.0.0.1:10086
+
+# 每个条目声明一类 worker：站点 + 模型 + 数量
+# model 必须和页面上显示的模型名一致（用于点击切换与校验）
+# kimi: model 为模型名子串，可选 "K3 · Max" / "K3 集群 · Max" / "K2.6 · Fast"
+# deepseek: model 为开关名子串，"深度思考" 表示开启深度思考；留空 "" 表示普通模式
+# （智能搜索始终强制关闭，避免联网检索拖慢批量任务）
+# minimax: model 为模型名子串，可选 "MiniMax-M3" / "MiniMax-M2.7" / "MiniMax-M2.7 HighSpeed"；
+# Agent 团队和思考两个开关始终强制关闭
+workers:
+  - site: kimi
+    model: "K2.6"
+    count: 3
+  - site: deepseek
+    model: ""
+    count: 3
+  - site: minimax
+    model: ""
+    count: 3
+
+task:
+  timeout_seconds: 600      # 单个任务从开始执行到判定完成的最长时间
+  retention_seconds: 3600   # 已完成任务结果保留时长
+  max_prompt_chars: 12000   # 超过则拒绝提交
+  stall_seconds: 120        # 生成停滞上限：超过该时长回答无进展则重建会话重试（僵尸"正在生成"态）
+
+queue:
+  max_size: 100             # 排队上限，满了 POST /api/tasks 返回 429
+
+dashboard:
+  history_size: 100         # 监控页展示的最近任务数
+
+# 接入 ERP：心跳自注册（局域网动态接入）。register_url 留空则不注册。
+# 局域网接入时 server.host 需改为 0.0.0.0
+erp:
+  register_url: ""          # 如 http://192.168.1.10:8888/api/system/relay-nodes/heartbeat
+  node_name: ""             # 空=自动取主机名
+  advertise_url: ""         # 上报给 ERP 的本机地址，空=自动探测局域网 IP + server.port
+  token: ""                 # 与 ERP 系统设置里的 RELAY_TOKEN 对应
+  interval_seconds: 30
