@@ -90,3 +90,35 @@ def test_摘要截断():
     summary = task.to_summary()
     assert len(summary.prompt_preview) == 120
     assert len(summary.result_preview) == 120
+
+
+def test_mark_retry_重置状态并记录tried_sites():
+    store = TaskStore()
+    task = store.create("你好", "kimi")
+    store.mark_running(task.task_id, worker_id="w1", actual_site="kimi")
+    store.mark_retry(task.task_id, "超时", failed_site="kimi")
+
+    assert task.status == TaskStatus.queued
+    assert task.retries == 1
+    assert task.tried_sites == ["kimi"]
+    assert task.worker_id is None
+    assert task.actual_site is None
+    assert task.started_at is None
+    assert task.finished_at is None
+    assert task.error == "超时"
+    # 重试不进 history
+    assert store.history() == []
+
+    info = task.to_info()
+    assert info.retries == 1
+    summary = task.to_summary()
+    assert summary.retries == 1
+
+
+def test_mark_retry_tried_sites去重():
+    store = TaskStore()
+    task = store.create("x", None)
+    store.mark_retry(task.task_id, "e1", failed_site="deepseek")
+    store.mark_retry(task.task_id, "e2", failed_site="deepseek")
+    assert task.tried_sites == ["deepseek"]
+    assert task.retries == 2

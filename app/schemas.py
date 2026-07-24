@@ -49,6 +49,7 @@ class TaskInfo(BaseModel):
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     elapsed_seconds: Optional[float] = None
+    retries: Optional[int] = None      # 已重新入队次数
 
 
 class TaskSummary(BaseModel):
@@ -62,6 +63,7 @@ class TaskSummary(BaseModel):
     error: Optional[str] = None
     created_at: float
     elapsed_seconds: Optional[float] = None
+    retries: Optional[int] = None      # 已重新入队次数
 
 
 class TaskListPage(BaseModel):

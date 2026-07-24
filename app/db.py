@@ -28,10 +28,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   error        TEXT,
   created_at   REAL NOT NULL,
   started_at   REAL,
-  finished_at  REAL
+  finished_at  REAL,
+  retries      INTEGER DEFAULT 0,  -- 已重新入队次数
+  tried_sites  TEXT                -- 已尝试过的站点，逗号分隔
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
 """
+
+# 存量库迁移：CREATE TABLE IF NOT EXISTS 不会给旧表加列
+_MIGRATIONS = (
+    ("retries", "ALTER TABLE tasks ADD COLUMN retries INTEGER DEFAULT 0"),
+    ("tried_sites", "ALTER TABLE tasks ADD COLUMN tried_sites TEXT"),
+)
 
 _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
@@ -48,7 +56,18 @@ def init(db_path: str) -> None:
             _conn.close()
         _conn = sqlite3.connect(db_path, check_same_thread=False)
         _conn.executescript(_SCHEMA)
+        _migrate(_conn)
     logger.info("任务存储 SQLite 已就绪: %s", db_path)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """给旧表补齐缺失列。"""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    for name, sql in _MIGRATIONS:
+        if name not in cols:
+            conn.execute(sql)
+            logger.info("SQLite 迁移：已添加列 %s", name)
+    conn.commit()
 
 
 def close() -> None:
@@ -70,10 +89,10 @@ def upsert_task(rec: dict) -> None:
     sql = """
     INSERT OR REPLACE INTO tasks
       (task_id, site, actual_site, worker_id, status, prompt, result, error,
-       created_at, started_at, finished_at)
+       created_at, started_at, finished_at, retries, tried_sites)
     VALUES
       (:task_id, :site, :actual_site, :worker_id, :status, :prompt, :result,
-       :error, :created_at, :started_at, :finished_at)
+       :error, :created_at, :started_at, :finished_at, :retries, :tried_sites)
     """
     with _lock:
         _required_conn().execute(sql, rec)
@@ -84,7 +103,8 @@ def get_task(task_id: str) -> Optional[dict]:
     with _lock:
         cur = _required_conn().execute(
             "SELECT task_id, site, actual_site, worker_id, status, prompt, result,"
-            " error, created_at, started_at, finished_at FROM tasks WHERE task_id = ?",
+            " error, created_at, started_at, finished_at, retries, tried_sites"
+            " FROM tasks WHERE task_id = ?",
             (task_id,))
         row = cur.fetchone()
     return _row_to_dict(row) if row else None
@@ -125,7 +145,7 @@ def list_tasks(page: int = 1, page_size: int = 20,
                status: Optional[str] = None) -> list[dict]:
     """按创建时间倒序分页查询。"""
     sql = ("SELECT task_id, site, actual_site, worker_id, status, prompt, result,"
-           " error, created_at, started_at, finished_at FROM tasks")
+           " error, created_at, started_at, finished_at, retries, tried_sites FROM tasks")
     args: list = []
     if status:
         sql += " WHERE status = ?"
@@ -139,5 +159,6 @@ def list_tasks(page: int = 1, page_size: int = 20,
 
 def _row_to_dict(row: tuple) -> dict:
     keys = ("task_id", "site", "actual_site", "worker_id", "status", "prompt",
-            "result", "error", "created_at", "started_at", "finished_at")
+            "result", "error", "created_at", "started_at", "finished_at",
+            "retries", "tried_sites")
     return dict(zip(keys, row))

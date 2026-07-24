@@ -98,3 +98,72 @@ def test_fail_unfinished_marks_zombies():
     assert r1["status"] == "failed" and "中断" in r1["error"]
     assert r2["status"] == "failed" and r2["finished_at"] is not None
     assert task_db.get_task(t3.task_id)["status"] == "done"  # 已完成不受影响
+
+
+def test_retries_and_tried_sites_persisted():
+    store = TaskStore()
+    t = store.create("跨站", "kimi")
+    store.mark_running(t.task_id, worker_id="w1", actual_site="kimi")
+    store.mark_retry(t.task_id, "卡死", failed_site="kimi")
+
+    row = task_db.get_task(t.task_id)
+    assert row["retries"] == 1
+    assert row["tried_sites"] == "kimi"
+    assert row["status"] == "queued"
+    assert row["actual_site"] is None
+
+    store._tasks.clear()
+    task = store.get(t.task_id)
+    assert task.retries == 1
+    assert task.tried_sites == ["kimi"]
+
+
+def test_migrate_adds_missing_columns(tmp_path):
+    """旧表缺少 retries/tried_sites 时，init 会 ALTER 补齐。"""
+    import sqlite3
+
+    db_path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+    CREATE TABLE tasks (
+      task_id TEXT PRIMARY KEY,
+      site TEXT,
+      actual_site TEXT,
+      worker_id TEXT,
+      status TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      result TEXT,
+      error TEXT,
+      created_at REAL NOT NULL,
+      started_at REAL,
+      finished_at REAL
+    );
+    """)
+    conn.execute(
+        "INSERT INTO tasks (task_id, status, prompt, created_at) VALUES (?,?,?,?)",
+        ("abc", "done", "旧", 1.0))
+    conn.commit()
+    conn.close()
+
+    task_db.close()
+    task_db.init(db_path)
+
+    cols = {r[1] for r in task_db._required_conn().execute(
+        "PRAGMA table_info(tasks)").fetchall()}
+    assert "retries" in cols
+    assert "tried_sites" in cols
+
+    row = task_db.get_task("abc")
+    assert row["prompt"] == "旧"
+    assert row["retries"] == 0 or row["retries"] is None
+
+    # 新字段可写
+    task_db.upsert_task({
+        "task_id": "abc", "site": None, "actual_site": None, "worker_id": None,
+        "status": "queued", "prompt": "旧", "result": None, "error": None,
+        "created_at": 1.0, "started_at": None, "finished_at": None,
+        "retries": 2, "tried_sites": "kimi,deepseek",
+    })
+    row = task_db.get_task("abc")
+    assert row["retries"] == 2
+    assert row["tried_sites"] == "kimi,deepseek"

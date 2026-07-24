@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
-from typing import Optional
+from typing import Callable, Optional
 
 from .schemas import WorkerState
 from .sites.base import SiteAdapter
@@ -35,7 +35,9 @@ class TaskTimeoutError(RuntimeError):
 class Worker:
     def __init__(self, worker_id: str, site: str, model: str, adapter: SiteAdapter,
                  store: TaskStore, timeout_seconds: float = 600,
-                 stall_seconds: float = 120):
+                 stall_seconds: float = 120,
+                 hard_timeout_seconds: float = 300,
+                 on_retry: Optional[Callable[[TaskRecord, str], bool]] = None):
         self.worker_id = worker_id
         self.site = site
         self.model = model
@@ -45,6 +47,10 @@ class Worker:
         # 生成停滞上限：超过该时长回答没有任何进展视为卡死（如 deepseek 僵尸"正在生成"态），
         # 抛 WebbridgeError 走重建/重试路径
         self.stall_seconds = stall_seconds
+        # 硬超时：不信任 generating，超过即失败并走跨站点重试
+        self.hard_timeout_seconds = hard_timeout_seconds
+        # 返回 True=已重新入队，False=已最终失败；None=无回调，走原 mark_failed
+        self.on_retry = on_retry
         self.state = WorkerState.starting
         self.detail: Optional[str] = None
         self.current_task_id: Optional[str] = None
@@ -140,12 +146,22 @@ class Worker:
             answer = await self._execute(task)
         except asyncio.CancelledError:
             self.store.mark_failed(task.task_id, "任务被取消")
+            self.fail_count += 1
             raise
         except Exception as e:
             error = str(e) or type(e).__name__
-            self.store.mark_failed(task.task_id, error)
-            self.fail_count += 1
-            logger.warning("任务 %s 失败: %s", task.task_id[:8], error)
+            if self.on_retry is not None:
+                # True=已重新入队；False=已达重试上限或队列满，最终失败
+                retried = self.on_retry(task, error)
+                if not retried:
+                    self.fail_count += 1
+                    logger.warning("任务 %s 最终失败: %s", task.task_id[:8], error)
+                else:
+                    logger.info("任务 %s 将跨站点重试: %s", task.task_id[:8], error)
+            else:
+                self.store.mark_failed(task.task_id, error)
+                self.fail_count += 1
+                logger.warning("任务 %s 失败: %s", task.task_id[:8], error)
         else:
             self.store.mark_done(task.task_id, answer)
             self.done_count += 1
@@ -192,12 +208,18 @@ class Worker:
         await self.adapter.send_prompt(task.prompt)
         logger.info("任务 %s 提示词已发送（%d 字）", task.task_id[:8], len(task.prompt))
 
-        deadline = time.monotonic() + self.timeout_seconds
-        stall_deadline = time.monotonic() + self.stall_seconds
+        started = time.monotonic()
+        hard_deadline = started + self.hard_timeout_seconds
+        deadline = started + self.timeout_seconds
+        stall_deadline = started + self.stall_seconds
         prev_answer: Optional[str] = None
         while True:
             await asyncio.sleep(POLL_INTERVAL)
             now = time.monotonic()
+            # 硬超时不信任 generating，防止僵尸生成占满 worker
+            if now > hard_deadline:
+                raise TaskTimeoutError(
+                    f"硬超时（{self.hard_timeout_seconds}s）")
             if now > deadline:
                 raise TaskTimeoutError("任务超时")
             if now > stall_deadline:

@@ -12,7 +12,7 @@ from app.store import TaskStore
 class FakeWorker:
     """模拟 worker：被指派后立即把任务标记完成。"""
 
-    def __init__(self, worker_id, site, store):
+    def __init__(self, worker_id, site, store, on_retry=None, fail_times=0):
         self.worker_id = worker_id
         self.site = site
         self.model = ""
@@ -22,6 +22,8 @@ class FakeWorker:
         self.done_count = 0
         self.fail_count = 0
         self.store = store
+        self.on_retry = on_retry
+        self.fail_times = fail_times  # 前 N 次指派失败
         self.ran = []
         self._task = None
 
@@ -38,25 +40,47 @@ class FakeWorker:
         self._task = asyncio.create_task(self.run_task(task))
 
     async def run_task(self, task):
-        self.store.mark_running(task.task_id)
+        self.store.mark_running(task.task_id, worker_id=self.worker_id,
+                                actual_site=self.site)
         await asyncio.sleep(0.01)  # 模拟执行耗时
         self.ran.append(task.task_id)
-        self.store.mark_done(task.task_id, f"答案 from {self.worker_id}")
-        self.done_count += 1
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            error = f"fake fail on {self.site}"
+            if self.on_retry is not None:
+                retried = self.on_retry(task, error)
+                if not retried:
+                    self.fail_count += 1
+            else:
+                self.store.mark_failed(task.task_id, error)
+                self.fail_count += 1
+        else:
+            self.store.mark_done(task.task_id, f"答案 from {self.worker_id}")
+            self.done_count += 1
         self.current_task_id = None
         self.state = WorkerState.idle
 
 
-def make_pool(worker_sites=(), queue_size=100, history_size=10):
+def make_pool(worker_sites=(), queue_size=100, history_size=10,
+              max_retries=3, retry_switch_site=True, fail_map=None):
+    """fail_map: {site: fail_times} 控制各站点 worker 前几次失败。"""
     config = Config.model_validate({
         "workers": [],  # worker 由测试注入
         "queue": {"max_size": queue_size},
         "dashboard": {"history_size": history_size},
+        "task": {
+            "max_retries": max_retries,
+            "retry_switch_site": retry_switch_site,
+        },
     })
     store = TaskStore(history_size)
     pool = WorkerPool(config, store, client=None, dispatch_interval=0.01)
+    fail_map = fail_map or {}
     for i, site in enumerate(worker_sites, 1):
-        pool.workers.append(FakeWorker(f"w{i}", site, store))
+        pool.workers.append(FakeWorker(
+            f"w{i}", site, store,
+            on_retry=pool._on_retry_needed,
+            fail_times=fail_map.get(site, 0)))
     return pool, store
 
 
@@ -144,3 +168,82 @@ async def test_workers_info与queue快照():
     snap = pool.queue_snapshot()
     assert len(snap) == 1
     assert snap[0].prompt_preview == "排队中"
+
+
+async def test_跨站点重试_失败后换站成功():
+    """kimi 失败一次 → 重新入队 → 派到 deepseek 成功。"""
+    pool, store = make_pool(
+        ["kimi", "deepseek"],
+        fail_map={"kimi": 1},
+        max_retries=3,
+        retry_switch_site=True,
+    )
+    await pool.start()
+    try:
+        tid = await pool.submit("跨站", "kimi")
+        assert await wait_done(store, tid) == TaskStatus.done
+        task = store.get(tid)
+        assert task.retries == 1
+        assert "kimi" in task.tried_sites
+        assert tid in pool.workers[0].ran  # kimi 试过
+        assert tid in pool.workers[1].ran  # deepseek 成功
+        assert task.result == "答案 from w2"
+        assert pool.workers[0].fail_count == 0  # 中间重试不计 fail
+    finally:
+        await pool.stop()
+
+
+async def test_重试耗尽后最终失败():
+    pool, store = make_pool(
+        ["kimi", "deepseek"],
+        fail_map={"kimi": 99, "deepseek": 99},
+        max_retries=2,
+        retry_switch_site=True,
+    )
+    await pool.start()
+    try:
+        tid = await pool.submit("必败", None)
+        assert await wait_done(store, tid, timeout=5.0) == TaskStatus.failed
+        task = store.get(tid)
+        assert task.retries == 2
+        assert "已重试 2 次" in (task.error or "")
+    finally:
+        await pool.stop()
+
+
+async def test_retry_switch_site_false_不跨站():
+    """关闭换站后，指定 kimi 的任务失败重试仍只派给 kimi。"""
+    pool, store = make_pool(
+        ["kimi", "deepseek"],
+        fail_map={"kimi": 1},
+        max_retries=3,
+        retry_switch_site=False,
+    )
+    await pool.start()
+    try:
+        tid = await pool.submit("只走 kimi", "kimi")
+        assert await wait_done(store, tid) == TaskStatus.done
+        assert tid in pool.workers[0].ran
+        assert pool.workers[1].ran == []  # deepseek 未接到
+        assert store.get(tid).result == "答案 from w1"
+    finally:
+        await pool.stop()
+
+
+def test_find_idle_worker_避开tried_sites():
+    pool, store = make_pool(["kimi", "deepseek", "minimax"],
+                            retry_switch_site=True)
+    # 模拟 kimi 已失败
+    w = pool._find_idle_worker("kimi", tried_sites=["kimi"])
+    assert w is not None
+    assert w.site != "kimi"
+
+
+def test_find_idle_worker_关闭换站():
+    pool, store = make_pool(["kimi", "deepseek"], retry_switch_site=False)
+    w = pool._find_idle_worker("kimi", tried_sites=["kimi"])
+    assert w is not None
+    assert w.site == "kimi"
+    # deepseek 忙时指定 kimi 仍只返回 kimi
+    pool.workers[0].state = WorkerState.busy
+    assert pool._find_idle_worker("kimi", tried_sites=["kimi"]) is None

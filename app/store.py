@@ -31,6 +31,16 @@ def _preview(text: Optional[str]) -> Optional[str]:
     return text[:PREVIEW_CHARS]
 
 
+def _sites_to_str(sites: list[str]) -> Optional[str]:
+    return ",".join(sites) if sites else None
+
+
+def _sites_from_str(s: Optional[str]) -> list[str]:
+    if not s:
+        return []
+    return [x for x in s.split(",") if x]
+
+
 @dataclass
 class TaskRecord:
     task_id: str
@@ -44,6 +54,8 @@ class TaskRecord:
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    retries: int = 0                    # 已重新入队次数
+    tried_sites: list[str] = field(default_factory=list)  # 已尝试过的站点
 
     def elapsed_seconds(self) -> Optional[float]:
         if self.started_at is None:
@@ -65,6 +77,7 @@ class TaskRecord:
             started_at=self.started_at,
             finished_at=self.finished_at,
             elapsed_seconds=self.elapsed_seconds(),
+            retries=self.retries,
         )
 
     def to_summary(self) -> TaskSummary:
@@ -78,6 +91,7 @@ class TaskRecord:
             error=self.error,
             created_at=self.created_at,
             elapsed_seconds=self.elapsed_seconds(),
+            retries=self.retries,
         )
 
     def to_db_dict(self) -> dict:
@@ -93,6 +107,8 @@ class TaskRecord:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "retries": self.retries,
+            "tried_sites": _sites_to_str(self.tried_sites),
         }
 
     @classmethod
@@ -109,6 +125,8 @@ class TaskRecord:
             created_at=d["created_at"],
             started_at=d.get("started_at"),
             finished_at=d.get("finished_at"),
+            retries=int(d["retries"] or 0) if d.get("retries") is not None else 0,
+            tried_sites=_sites_from_str(d.get("tried_sites")),
         )
 
 
@@ -154,6 +172,7 @@ class TaskStore:
         task = self._tasks[task_id]
         task.status = TaskStatus.done
         task.result = result
+        task.error = None
         task.finished_at = time.time()
         self._history.append(task)
         self._persist(task)
@@ -164,6 +183,21 @@ class TaskStore:
         task.error = error
         task.finished_at = time.time()
         self._history.append(task)
+        self._persist(task)
+
+    def mark_retry(self, task_id: str, reason: str,
+                   failed_site: Optional[str] = None) -> None:
+        """失败后重新入队：状态回到 queued，记录已试站点。不写入 history。"""
+        task = self._tasks[task_id]
+        if failed_site and failed_site not in task.tried_sites:
+            task.tried_sites.append(failed_site)
+        task.retries += 1
+        task.status = TaskStatus.queued
+        task.started_at = None
+        task.worker_id = None
+        task.actual_site = None
+        task.finished_at = None
+        task.error = reason
         self._persist(task)
 
     def history(self) -> list[TaskRecord]:

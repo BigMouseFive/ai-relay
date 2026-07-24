@@ -10,7 +10,7 @@ from .config import Config
 from .schemas import TaskSummary, WorkerInfo, WorkerState
 from .sites import create_adapter
 from .sites.base import SiteAdapter
-from .store import TaskStore
+from .store import TaskRecord, TaskStore
 from .webbridge import WebbridgeClient
 from .worker import Worker
 
@@ -36,6 +36,8 @@ class WorkerPool:
         self.workers: list[Worker] = []
         self._dispatcher: Optional[asyncio.Task] = None
         self._dispatch_interval = dispatch_interval
+        self.max_retries = config.task.max_retries
+        self.retry_switch_site = config.task.retry_switch_site
         factory = adapter_factory or create_adapter
         n = 0
         for wc in config.workers:
@@ -46,7 +48,9 @@ class WorkerPool:
                     worker_id=f"w{n}", site=wc.site, model=wc.model,
                     adapter=adapter, store=store,
                     timeout_seconds=config.task.timeout_seconds,
-                    stall_seconds=config.task.stall_seconds))
+                    stall_seconds=config.task.stall_seconds,
+                    hard_timeout_seconds=config.task.hard_timeout_seconds,
+                    on_retry=self._on_retry_needed))
 
     async def start(self) -> None:
         await asyncio.gather(*(w.start() for w in self.workers))
@@ -76,6 +80,30 @@ class WorkerPool:
                     task.task_id[:8], site or "任意", self.queue.qsize())
         return task.task_id
 
+    def _on_retry_needed(self, task: TaskRecord, reason: str) -> bool:
+        """任务失败后尝试重新入队。返回 True=已重入队，False=最终失败。"""
+        current = self.store.get(task.task_id) or task
+        if current.retries >= self.max_retries:
+            self.store.mark_failed(
+                current.task_id,
+                f"{reason}（已重试 {current.retries} 次）")
+            logger.warning("任务 %s 重试耗尽（%d 次）: %s",
+                           current.task_id[:8], current.retries, reason)
+            return False
+        failed_site = current.actual_site
+        self.store.mark_retry(current.task_id, reason, failed_site=failed_site)
+        try:
+            self.queue.put_nowait(current)
+        except asyncio.QueueFull:
+            self.store.mark_failed(
+                current.task_id, f"{reason}（重试时队列已满）")
+            logger.warning("任务 %s 重试时队列已满", current.task_id[:8])
+            return False
+        logger.info("任务 %s 重新入队（retries=%d, tried=%s）: %s",
+                    current.task_id[:8], current.retries,
+                    ",".join(current.tried_sites) or "-", reason)
+        return True
+
     async def _dispatch_loop(self) -> None:
         while True:
             # 扫描队列中第一个"有空闲匹配 worker"的任务并指派；
@@ -85,11 +113,12 @@ class WorkerPool:
                 items = self.queue._queue  # asyncio.Queue 无公开遍历接口，只读扫描
                 assigned = False
                 for task in list(items):
-                    worker = self._find_idle_worker(task.site)
+                    worker = self._find_idle_worker(task.site, task.tried_sites)
                     if worker is None:
                         continue
                     items.remove(task)
-                    logger.info("任务 %s 指派给 worker %s", task.task_id[:8], worker.worker_id)
+                    logger.info("任务 %s 指派给 worker %s（%s）",
+                                task.task_id[:8], worker.worker_id, worker.site)
                     worker.start_task(task)
                     assigned = True
                     break
@@ -97,11 +126,37 @@ class WorkerPool:
                     break
             await asyncio.sleep(self._dispatch_interval)
 
-    def _find_idle_worker(self, site: Optional[str]) -> Optional[Worker]:
-        for w in self.workers:
-            if w.state == WorkerState.idle and (site is None or w.site == site):
+    def _find_idle_worker(self, site: Optional[str],
+                          tried_sites: Optional[list[str]] = None) -> Optional[Worker]:
+        tried = tried_sites or []
+
+        def _idle(pred) -> Optional[Worker]:
+            for w in self.workers:
+                if w.state == WorkerState.idle and pred(w):
+                    return w
+            return None
+
+        if not self.retry_switch_site:
+            # 禁止换站：仅匹配指定站点（或任意）
+            return _idle(lambda x: site is None or x.site == site)
+
+        # 允许换站：
+        # 1. 指定站点且尚未失败过该站 → 仍优先本站
+        if site and site not in tried:
+            w = _idle(lambda x: x.site == site)
+            if w is not None:
                 return w
-        return None
+            # 本站忙且还没失败过：继续等，不提前换站
+            if not tried:
+                return None
+
+        # 2. 避开已试站点
+        w = _idle(lambda x: x.site not in tried)
+        if w is not None:
+            return w
+
+        # 3. 仍无：任意空闲（含已试）
+        return _idle(lambda x: True)
 
     # ---- 监控快照 ----
 

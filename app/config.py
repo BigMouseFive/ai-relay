@@ -27,6 +27,9 @@ class TaskConfig(BaseModel):
     retention_seconds: int = 3600
     max_prompt_chars: int = 12000
     stall_seconds: int = 120      # 生成停滞上限（无进展即重建会话重试）
+    max_retries: int = 3          # 失败后允许重新入队的次数（总执行次数 = max_retries + 1）
+    hard_timeout_seconds: int = 300  # 硬超时：不信任 generating，超过即失败并重试
+    retry_switch_site: bool = True   # 重试时是否允许换到其他站点
 
 
 class QueueConfig(BaseModel):
