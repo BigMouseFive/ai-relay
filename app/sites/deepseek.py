@@ -9,7 +9,7 @@ import json
 import logging
 
 from ..webbridge import WebbridgeError
-from .base import SiteAdapter
+from .base import SendOutcomeUnknownError, SiteAdapter
 
 logger = logging.getLogger("ai-relay.deepseek")
 
@@ -68,7 +68,7 @@ class DeepseekAdapter(SiteAdapter):
             await self._set_toggle(0, "深度思考", False)
 
     async def _set_toggle(self, index: int, name: str, desired: bool) -> None:
-        """把第 index 个开关设置为期望状态并校验；找不到开关时静默跳过（容错）。"""
+        """把第 index 个受控开关设置为期望状态并回读校验。"""
         desired_js = "true" if desired else "false"
         click_js = """
         (() => {
@@ -80,8 +80,7 @@ class DeepseekAdapter(SiteAdapter):
         """ % (index, desired_js)
         r = await self.client.evaluate(click_js, self.session)
         if r != "OK":
-            logger.warning("deepseek 未找到开关: %s", name)
-            return
+            raise WebbridgeError(f"deepseek 未找到开关: {name}")
         await asyncio.sleep(0.5)
         check_js = """
         (() => {
@@ -136,21 +135,25 @@ class DeepseekAdapter(SiteAdapter):
             await asyncio.sleep(1)
         else:
             raise WebbridgeError("deepseek 输入框注入失败")
-        await self.client.click(
-            "div[role=button].ds-button--primary.ds-button--circle", self.session)
-        # 校验消息确实发出（发送后 textarea 清空或出现消息），否则重试点发送
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            sent = await self.client.evaluate(
-                "(() => { const ta = document.querySelector('textarea');"
-                " if (!ta || ta.value !== '') return !!document.querySelector('.ds-message');"
-                " return true; })()",
-                self.session)
-            if sent:
-                return
+        # click 后禁止盲目重试，避免 WebBridge 响应丢失时重复向真实站点发送。
+        try:
             await self.client.click(
                 "div[role=button].ds-button--primary.ds-button--circle", self.session)
-        raise WebbridgeError("deepseek 消息发送失败（点击发送无反应）")
+            prompt_js = json.dumps(prompt.strip())
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                sent = await self.client.evaluate(
+                    "(() => { const expected = %s; const ta = document.querySelector('textarea');"
+                    " const messages = [...document.querySelectorAll('.ds-message')];"
+                    " const hasPrompt = messages.some(x => (x.innerText || '').trim() === expected);"
+                    " const d = document.querySelector('.ds-button--primary.ds-button--circle svg path')?.getAttribute('d') || '';"
+                    " return hasPrompt || !ta || ta.value === '' || d.startsWith('M2 4.88'); })()" % prompt_js,
+                    self.session)
+                if sent:
+                    return
+        except Exception as e:
+            raise SendOutcomeUnknownError(f"deepseek 发送后无法确认状态: {e}") from e
+        raise SendOutcomeUnknownError("deepseek 点击发送后未能确认消息是否送达")
 
     async def poll_once(self) -> dict:
         data = await self._eval_json(_POLL_JS)

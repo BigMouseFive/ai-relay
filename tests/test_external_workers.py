@@ -1,0 +1,181 @@
+"""ACP/OpenAI-compatible worker 的隔离测试；不执行真实 agent 或远端 HTTP。"""
+from __future__ import annotations
+
+import asyncio
+import json
+
+import httpx
+import pytest
+
+from app.config import AcpTargetConfig, OpenAICompatibleTargetConfig
+from app.external_workers import (
+    AcpWorker, ExternalOutcomeUnknownError, ExternalResult, OpenAICompatibleWorker,
+)
+from app.schemas import BackendType, TaskStatus, WorkerState
+from app.store import TaskStore
+
+
+def _retry(task, reason, code):
+    return False
+
+
+class FakeApiWorker(OpenAICompatibleWorker):
+    """绕过真实 env/client 初始化，只验证统一 worker 的状态持久化。"""
+
+    def __init__(self, target, store, result=None, error=None):
+        super().__init__("api-test-1", target, store, 30, _retry)
+        self.result = result
+        self.error = error
+
+    async def _validate_ready(self):
+        self._api_key = "fake"
+
+    async def _execute(self, task):
+        if self.error:
+            raise self.error
+        return self.result
+
+
+async def test_api_worker_success_persists_target_attempt_metadata(monkeypatch):
+    monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
+    target = OpenAICompatibleTargetConfig(
+        id="api-a", type="openai_compatible", base_url="http://fake.test/v1",
+        api_key_env="TEST_OPENAI_KEY", model="fake-model",
+    )
+    store = TaskStore()
+    task = store.create("hello", None, target_id=target.id,
+                        backend_type=BackendType.openai_compatible, model=target.model)
+    worker = FakeApiWorker(target, store, result=ExternalResult(
+        text="world", external_request_id="chatcmpl-test", provider_status_code=200,
+        usage={"prompt_tokens": 1, "completion_tokens": 1},
+    ))
+    await worker.start()
+    worker.start_task(task)
+    await worker._run_task
+
+    saved = store.get(task.task_id)
+    assert saved.status == TaskStatus.done
+    assert saved.actual_target_id == "api-a"
+    assert saved.actual_backend_type == BackendType.openai_compatible
+    assert saved.upstream_request_id == "chatcmpl-test"
+    assert saved.usage == {"prompt_tokens": 1, "completion_tokens": 1}
+    attempt = saved.to_info().attempts[0]
+    assert attempt.target_id == "api-a"
+    assert attempt.backend_type == BackendType.openai_compatible
+    assert attempt.external_request_id == "chatcmpl-test"
+    assert attempt.provider_status_code == 200
+
+
+async def test_api_worker_outcome_unknown_is_not_retried(monkeypatch):
+    monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
+    target = OpenAICompatibleTargetConfig(
+        id="api-a", type="openai_compatible", base_url="http://fake.test/v1",
+        api_key_env="TEST_OPENAI_KEY", model="fake-model",
+    )
+    store = TaskStore()
+    task = store.create("hello", None, target_id=target.id,
+                        backend_type=BackendType.openai_compatible, model=target.model)
+    worker = FakeApiWorker(target, store, error=ExternalOutcomeUnknownError("read timeout"))
+    await worker.start()
+    worker.start_task(task)
+    await worker._run_task
+    assert store.get(task.task_id).status == TaskStatus.outcome_unknown
+
+
+async def test_openai_worker_missing_key_degrades_without_http_call(monkeypatch):
+    monkeypatch.delenv("MISSING_OPENAI_KEY", raising=False)
+    target = OpenAICompatibleTargetConfig(
+        id="api-missing", type="openai_compatible", base_url="http://fake.test/v1",
+        api_key_env="MISSING_OPENAI_KEY", model="fake-model",
+    )
+    worker = OpenAICompatibleWorker("api-test-1", target, TaskStore(), 30, _retry)
+    await worker.start()
+    assert worker.state == WorkerState.degraded
+    assert "环境变量未设置" in (worker.detail or "")
+
+
+async def test_openai_chat_completions_uses_v1_path_and_task_idempotency(monkeypatch):
+    monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["auth"] = request.headers.get("authorization")
+        captured["idempotency"] = request.headers.get("idempotency-key")
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "chatcmpl-mock", "choices": [{"message": {"content": "mock answer"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+        })
+
+    target = OpenAICompatibleTargetConfig(
+        id="api-transport", type="openai_compatible", base_url="http://mock.invalid/v1",
+        api_key_env="TEST_OPENAI_KEY", model="fake-model",
+    )
+    store = TaskStore()
+    task = store.create("hello", None, target_id=target.id,
+                        backend_type=BackendType.openai_compatible, model=target.model)
+    worker = OpenAICompatibleWorker("api-transport-1", target, store, 30, _retry)
+    await worker.start()
+    assert worker._client is not None
+    await worker._client.aclose()
+    worker._client = httpx.AsyncClient(
+        base_url=target.base_url, transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer not-a-real-key", "Content-Type": "application/json"},
+    )
+    result = await worker._execute(task)
+    await worker.stop()
+
+    assert result.text == "mock answer"
+    assert result.external_request_id == "chatcmpl-mock"
+    assert captured["path"] == "/v1/chat/completions"
+    assert captured["auth"] == "Bearer not-a-real-key"
+    assert captured["idempotency"] == task.task_id
+    assert captured["body"]["model"] == "fake-model"
+
+
+async def test_external_worker_cancellation_becomes_cancelled(monkeypatch):
+    monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
+    target = OpenAICompatibleTargetConfig(
+        id="api-cancel", type="openai_compatible", base_url="http://fake.test/v1",
+        api_key_env="TEST_OPENAI_KEY", model="fake-model",
+    )
+    store = TaskStore()
+    task = store.create("hello", None, target_id=target.id,
+                        backend_type=BackendType.openai_compatible, model=target.model)
+    store.request_cancel(task.task_id)
+    worker = FakeApiWorker(target, store, result=ExternalResult(text="should not run"))
+    await worker.start()
+    worker.start_task(task)
+    await worker._run_task
+    assert store.get(task.task_id).status == TaskStatus.cancelled
+
+
+def test_openai_response_content_parser():
+    assert OpenAICompatibleWorker._content_to_text("hello") == "hello"
+    assert OpenAICompatibleWorker._content_to_text([{"text": "a"}, "b"]) == "ab"
+    with pytest.raises(TypeError):
+        OpenAICompatibleWorker._content_to_text({"text": "bad"})
+
+
+async def test_acp_missing_working_directory_degrades_without_process():
+    target = AcpTargetConfig(
+        id="acp-missing-dir", type="acp", command="agent",
+        working_directory="/definitely/not/a/workspace",
+    )
+    worker = AcpWorker("acp-test-1", target, TaskStore(), 30, _retry)
+    await worker.start()
+    assert worker.state == WorkerState.degraded
+    assert "工作目录不存在" in (worker.detail or "")
+
+
+async def test_acp_missing_configured_key_degrades_without_process(tmp_path, monkeypatch):
+    monkeypatch.delenv("MISSING_CURSOR_KEY", raising=False)
+    target = AcpTargetConfig(
+        id="acp-missing-key", type="acp", command="agent",
+        working_directory=str(tmp_path), api_key_env="MISSING_CURSOR_KEY",
+    )
+    worker = AcpWorker("acp-test-1", target, TaskStore(), 30, _retry)
+    await worker.start()
+    assert worker.state == WorkerState.degraded
+    assert "环境变量未设置" in (worker.detail or "")

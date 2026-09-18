@@ -15,16 +15,19 @@ class WebbridgeError(RuntimeError):
 
 
 class WebbridgeClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:10086", timeout: float = 60.0):
+    def __init__(self, base_url: str = "http://127.0.0.1:10086", timeout: float = 60.0,
+                 status_timeout: float = 5.0):
         self.base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(timeout=timeout)
+        self._status_timeout = status_timeout
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def status(self) -> dict:
         try:
-            resp = await self._client.get(f"{self.base_url}/status")
+            resp = await self._client.get(
+                f"{self.base_url}/status", timeout=self._status_timeout)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -50,7 +53,7 @@ class WebbridgeClient:
             resp = await self._client.post(f"{self.base_url}/command", json=body)
             resp.raise_for_status()
             data = resp.json()
-        except httpx.HTTPError as e:
+        except Exception as e:
             raise WebbridgeError(f"webbridge {action} 请求失败: {e}") from e
         if isinstance(data, dict) and data.get("success") is False:
             raise WebbridgeError(f"webbridge {action} 失败: {data.get('error') or data}")

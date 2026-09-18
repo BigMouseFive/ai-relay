@@ -44,14 +44,12 @@ class FakeClient:
                     return "OK"
                 if "getAttribute('aria-checked')" in code:
                     return "true" if self.toggles[tid] else "false"
-        if "innerText.trim().length > 0" in code:
+        if "innerText.trim().length > 0" in code or "el.tagName === 'TEXTAREA'" in code:
             return self.editor_filled
-        if "stop-button" in code and "send-button" in code:
-            if self.stop_button:
-                return "sent"
-            return "pending"
         if "assistant-active-flow" in code:
             return json.dumps({"generating": False, "answer": "42", "error": None})
+        if "return hasPrompt ||" in code:
+            return self.stop_button
         if "model-selector-trigger" in code:
             return "MiniMax-M3"
         raise AssertionError(f"未预期的 evaluate: {code[:100]}")

@@ -1,7 +1,4 @@
-"""agent.minimaxi.com 站点适配器（选择器来自实测调研，全部用稳定 data-testid）。
-
-要求：Agent 团队和思考两个开关始终保持关闭。
-"""
+"""agent.minimaxi.com 站点适配器（选择器来自实测调研，优先 data-testid）。"""
 from __future__ import annotations
 
 import asyncio
@@ -9,12 +6,10 @@ import json
 import logging
 
 from ..webbridge import WebbridgeError
-from .base import SiteAdapter
+from .base import SendOutcomeUnknownError, SiteAdapter
 
 logger = logging.getLogger("ai-relay.minimax")
 
-# 生成中标志：发送按钮被替换为 stop-button（存在即生成中，消失即完成）
-# 回答取最后一个含 assistant-active-flow 的 message-item（过程/工具调用 UI 不在其中，天然分离）
 _POLL_JS = """
 (() => {
   const generating = !!document.querySelector('[data-testid="stop-button"]');
@@ -27,7 +22,6 @@ _POLL_JS = """
 })()
 """
 
-# 两个必须保持关闭的开关：Agent 团队、思考
 _TOGGLES_OFF = [
     ("agent-team-toggle", "Agent 团队"),
     ("model-thinking-trigger-toggle", "思考"),
@@ -42,7 +36,6 @@ class MinimaxAdapter(SiteAdapter):
         return bool(await self.client.evaluate(code, self.session))
 
     async def ensure_model(self, model: str) -> None:
-        # Agent 团队 / 思考：始终确保关闭（开关状态跨会话持久化，先读再点，不盲切）
         for testid, name in _TOGGLES_OFF:
             await self._set_toggle_off(testid, name)
         if model:
@@ -57,9 +50,11 @@ class MinimaxAdapter(SiteAdapter):
           return 'OK';
         })()
         """ % testid
-        r = await self.client.evaluate(click_js, self.session)
-        if r != "OK":
-            logger.warning("minimax 未找到开关: %s", name)
+        result = await self.client.evaluate(click_js, self.session)
+        if result != "OK":
+            # 当前 MiniMax 页面可能不展示这些可选开关；它们不影响基础问答。
+            # 仅告警并继续，避免整个 target 因 UI 版本差异被错误标记 degraded。
+            logger.warning("minimax 未找到可选开关: %s（继续使用当前页面默认模式）", name)
             return
         await asyncio.sleep(0.3)
         check_js = """
@@ -68,8 +63,7 @@ class MinimaxAdapter(SiteAdapter):
           return b ? b.getAttribute('aria-checked') : null;
         })()
         """ % testid
-        checked = await self.client.evaluate(check_js, self.session)
-        if checked == "true":
+        if await self.client.evaluate(check_js, self.session) == "true":
             raise WebbridgeError(f"minimax 开关未能关闭: {name}")
 
     async def _select_model(self, model: str) -> None:
@@ -91,8 +85,7 @@ class MinimaxAdapter(SiteAdapter):
           return 'OK';
         })()
         """ % json.dumps(model)
-        r = await self.client.evaluate(click_js, self.session)
-        if r != "OK":
+        if await self.client.evaluate(click_js, self.session) != "OK":
             raise WebbridgeError(f"minimax 未找到模型: {model}")
         await asyncio.sleep(0.5)
         current = await self.client.evaluate(current_js, self.session)
@@ -103,40 +96,38 @@ class MinimaxAdapter(SiteAdapter):
         await self.client.navigate(self.home_url, self.session, new_tab=False)
 
     async def send_prompt(self, prompt: str) -> None:
-        # 页面未就绪时 fill 可能静默失败，先校验内容落入编辑器再点发送
         for _ in range(3):
             await self.client.fill('[data-testid="message-textarea"]', prompt, self.session)
             await asyncio.sleep(0.5)
             filled = await self.client.evaluate(
                 "(() => { const el = document.querySelector('[data-testid=\"message-textarea\"]');"
-                " return el ? el.innerText.trim().length > 0 : false; })()",
+                " return el ? (el.tagName === 'TEXTAREA' ? el.value : el.innerText).trim().length > 0 : false; })()",
                 self.session)
             if filled:
                 break
             await asyncio.sleep(1)
         else:
             raise WebbridgeError("minimax 输入框填入失败")
-        await self.client.click('[data-testid="send-button"]', self.session)
-        # 校验消息确实发出：stop-button 出现 / 进入 /mavis 会话页 / 出现用户消息气泡
-        # （生成中发送按钮会被替换为 stop-button，此时绝不能再点）
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            state = await self.client.evaluate(
-                "(() => {"
-                " if (document.querySelector('[data-testid=\"stop-button\"]')) return 'sent';"
-                " if (location.pathname.startsWith('/mavis')) return 'sent';"
-                " if (document.querySelector('[data-testid=\"message-item\"] [class*=\"user-message-bubble\"],"
-                "     [data-testid=\"message-item\"].user-message-bubble')) return 'sent';"
-                " if (document.querySelector('[data-testid=\"send-button\"]')) return 'pending';"
-                " return 'unknown'; })()",
-                self.session)
-            if state in ("sent", "unknown"):
-                return
+
+        # click 后禁止重放；无法确认时交给 worker 标记 outcome_unknown。
+        try:
             await self.client.click('[data-testid="send-button"]', self.session)
-        raise WebbridgeError("minimax 消息发送失败（点击发送无反应）")
+            prompt_js = json.dumps(prompt.strip())
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                sent = await self.client.evaluate(
+                    "(() => { const expected = %s;"
+                    " const users = [...document.querySelectorAll('[data-testid=\"message-item\"]')];"
+                    " const hasPrompt = users.some(x => (x.innerText || '').trim() === expected);"
+                    " return hasPrompt || !!document.querySelector('[data-testid=\"stop-button\"]'); })()" % prompt_js,
+                    self.session)
+                if sent:
+                    return
+        except Exception as e:
+            raise SendOutcomeUnknownError(f"minimax 发送后无法确认状态: {e}") from e
+        raise SendOutcomeUnknownError("minimax 点击发送后未能确认消息是否送达")
 
     async def poll_once(self) -> dict:
         data = await self._eval_json(_POLL_JS)
         return {"generating": bool(data.get("generating")),
-                "answer": data.get("answer"),
-                "error": data.get("error")}
+                "answer": data.get("answer"), "error": data.get("error")}

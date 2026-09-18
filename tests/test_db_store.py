@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from app import db as task_db
+from app.schemas import TaskPhase
 from app.store import TaskStore
 
 
@@ -69,6 +72,26 @@ def test_pagination_order_and_pages():
     assert page3[-1]["prompt"] == "任务0"
 
 
+def test_task_filters_by_keyword_target_backend_and_time():
+    from app.schemas import BackendType
+
+    store = TaskStore()
+    matched = store.create("特殊关键词", None, target_id="api-a", backend_type=BackendType.openai_compatible)
+    store.mark_running(matched.task_id, actual_target_id="api-a", actual_backend_type=BackendType.openai_compatible)
+    store.mark_done(matched.task_id, "匹配结果")
+    other = store.create("普通任务", "kimi")
+    other.created_at = matched.created_at + 10
+    store._persist(other)
+    store.mark_failed(other.task_id, "普通错误")
+
+    rows = task_db.list_tasks(q="特殊关键词")
+    assert [row["task_id"] for row in rows] == [matched.task_id]
+    assert task_db.count_tasks(q="匹配结果") == 1
+    assert task_db.count_tasks(target_id="api-a") == 1
+    assert task_db.count_tasks(backend_type="openai_compatible") == 1
+    assert task_db.count_tasks(created_after=matched.created_at - 1, created_before=matched.created_at + 1) == 1
+
+
 def test_status_filter():
     store = TaskStore()
     t1 = store.create("a", None)
@@ -116,6 +139,103 @@ def test_retries_and_tried_sites_persisted():
     task = store.get(t.task_id)
     assert task.retries == 1
     assert task.tried_sites == ["kimi"]
+
+
+def test_create_is_fail_closed_when_sqlite_write_fails(monkeypatch):
+    store = TaskStore()
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(task_db, "create_or_get_idempotent", fail)
+    with pytest.raises(OSError, match="disk full"):
+        store.create("不能丢失", None)
+    assert store._tasks == {}
+
+
+def test_idempotency_reuses_same_request_and_rejects_conflict():
+    store = TaskStore()
+    task, reused = store.create_or_get_idempotent("幂等任务", "kimi", idempotency_key="key-1")
+    same, same_reused = store.create_or_get_idempotent("幂等任务", "kimi", idempotency_key="key-1")
+    assert reused is False
+    assert same_reused is True
+    assert same.task_id == task.task_id
+
+    with pytest.raises(task_db.IdempotencyConflict):
+        store.create_or_get_idempotent("不同内容", "kimi", idempotency_key="key-1")
+
+
+def test_events_and_attempts_are_persisted():
+    store = TaskStore()
+    task = store.create("审计", "kimi")
+    store.mark_running(task.task_id, worker_id="w1", actual_site="kimi")
+    attempt_id = store.start_attempt(task.task_id, "w1", "kimi", "K2.6")
+    store.set_phase(task.task_id, TaskPhase.sending)
+    store.update_attempt(task.task_id, send_state="sent_confirmed")
+    store.mark_done(task.task_id, "完成")
+
+    events = task_db.list_events(task.task_id)
+    attempts = task_db.list_attempts(task.task_id)
+    assert any(event["event_type"] == "task_created" for event in events)
+    assert any(event["event_type"] == "task_completed" for event in events)
+    assert attempts[0]["attempt_id"] == attempt_id
+    assert attempts[0]["send_state"] == "sent_confirmed"
+
+
+def test_recover_unfinished_preserves_queued_and_interrupts_running():
+    store = TaskStore()
+    queued = store.create("可恢复", None)
+    running = store.create("不可盲重试", None)
+    store.mark_running(running.task_id, worker_id="w1", actual_site="kimi")
+
+    result = task_db.recover_unfinished()
+    assert result == {"recoverable": 1, "interrupted": 1}
+    assert task_db.get_task(queued.task_id)["status"] == "queued"
+    assert task_db.get_task(running.task_id)["status"] == "interrupted"
+
+
+def test_target_and_external_attempt_metadata_persist():
+    from app.schemas import BackendType
+
+    store = TaskStore()
+    task = store.create("API", None, target_id="api-one",
+                        backend_type=BackendType.openai_compatible, model="m1")
+    store.mark_running(task.task_id, worker_id="api-api-one-1", actual_target_id="api-one",
+                       actual_backend_type=BackendType.openai_compatible)
+    store.start_attempt(task.task_id, "api-api-one-1", None, "m1", target_id="api-one",
+                        backend_type=BackendType.openai_compatible)
+    store.mark_done(task.task_id, "ok", external_request_id="chatcmpl-1",
+                    provider_status_code=200, usage={"total_tokens": 4})
+
+    store._tasks.clear()
+    saved = store.get(task.task_id)
+    assert saved.target_id == "api-one"
+    assert saved.actual_target_id == "api-one"
+    assert saved.backend_type == BackendType.openai_compatible
+    assert saved.upstream_request_id == "chatcmpl-1"
+    assert saved.usage == {"total_tokens": 4}
+    attempt = saved.to_info().attempts[0]
+    assert attempt.target_id == "api-one"
+    assert attempt.provider_status_code == 200
+    assert attempt.usage == {"total_tokens": 4}
+
+
+def test_prune_terminal_tasks_redacts_then_deletes():
+    store = TaskStore()
+    task = store.create("敏感提示词", None)
+    store.mark_done(task.task_id, "敏感回答")
+    record = task_db.get_task(task.task_id)
+    cutoff = record["finished_at"] + 1
+
+    result = task_db.prune_terminal_tasks(cutoff, cutoff - 1)
+    assert result["redacted"] == 1
+    redacted = task_db.get_task(task.task_id)
+    assert redacted["prompt"] == "[已按保留策略清除]"
+    assert redacted["result"] is None
+
+    result = task_db.prune_terminal_tasks(cutoff, cutoff + 1)
+    assert result["deleted"] == 1
+    assert task_db.get_task(task.task_id) is None
 
 
 def test_migrate_adds_missing_columns(tmp_path):

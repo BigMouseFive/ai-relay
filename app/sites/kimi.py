@@ -5,7 +5,7 @@ import asyncio
 import json
 
 from ..webbridge import WebbridgeError
-from .base import SiteAdapter
+from .base import SendOutcomeUnknownError, SiteAdapter
 
 # 生成中标志：发送按钮 class 含 stop；答案取最后一条 assistant 段的 markdown
 # "已停止内容生成"是 kimi 生成被中止时的占位文本，要识别为站点错误而非正常结果
@@ -82,21 +82,22 @@ class KimiAdapter(SiteAdapter):
             await asyncio.sleep(1)
         else:
             raise WebbridgeError("kimi 输入框填入失败（Lexical 未就绪）")
-        await self.client.click(".send-button-container", self.session)
-        # 校验消息确实发出（出现用户消息段、进入 /chat/ 会话页，或按钮变为停止态）。
-        # 注意：发送成功后该按钮立即变为"停止生成"按钮（带 .stop class），
-        # 重试点击前必须先排除这种状态，否则会误点"停止"把生成中止（"已停止内容生成"）
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            sent = await self.client.evaluate(
-                "(() => !!document.querySelector('.segment-user')"
-                " || location.pathname.startsWith('/chat')"
-                " || !!document.querySelector('.send-button-container.stop'))()",
-                self.session)
-            if sent:
-                return
+        # click 一旦尝试，网络异常也不能证明页面没有收到请求；绝不自动重复 click。
+        try:
             await self.client.click(".send-button-container", self.session)
-        raise WebbridgeError("kimi 消息发送失败（点击发送无反应）")
+            prompt_js = json.dumps(prompt.strip())
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                sent = await self.client.evaluate(
+                    "(() => { const expected = %s; const users = [...document.querySelectorAll('.segment-user')];"
+                    " return !!document.querySelector('.send-button-container.stop') ||"
+                    " users.some(x => (x.innerText || '').trim() === expected); })()" % prompt_js,
+                    self.session)
+                if sent:
+                    return
+        except Exception as e:
+            raise SendOutcomeUnknownError(f"kimi 发送后无法确认状态: {e}") from e
+        raise SendOutcomeUnknownError("kimi 点击发送后未能确认消息是否送达")
 
     async def poll_once(self) -> dict:
         data = await self._eval_json(_POLL_JS)

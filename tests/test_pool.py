@@ -48,7 +48,7 @@ class FakeWorker:
             self.fail_times -= 1
             error = f"fake fail on {self.site}"
             if self.on_retry is not None:
-                retried = self.on_retry(task, error)
+                retried = self.on_retry(task, error, "fake_error")
                 if not retried:
                     self.fail_count += 1
             else:
@@ -71,6 +71,8 @@ def make_pool(worker_sites=(), queue_size=100, history_size=10,
         "task": {
             "max_retries": max_retries,
             "retry_switch_site": retry_switch_site,
+            "retry_initial_delay_seconds": 0.01,
+            "retry_max_delay_seconds": 0.01,
         },
     })
     store = TaskStore(history_size)
@@ -237,6 +239,52 @@ def test_find_idle_worker_避开tried_sites():
     w = pool._find_idle_worker("kimi", tried_sites=["kimi"])
     assert w is not None
     assert w.site != "kimi"
+
+
+def test_find_idle_worker_按请求模型匹配():
+    pool, _ = make_pool(["kimi", "deepseek"])
+    pool.workers[0].model = "K2.6"
+    pool.workers[1].model = "深度思考"
+    assert pool._find_idle_worker("kimi", model="K2.6") is pool.workers[0]
+    assert pool._find_idle_worker("kimi", model="不存在") is None
+
+
+async def test_submit_请求未配置模型被拒绝():
+    pool, _ = make_pool(["kimi"])
+    pool.workers[0].model = "K2.6"
+    with pytest.raises(ValueError, match="模型"):
+        await pool.submit_with_metadata("模型", "kimi", model="K3")
+
+
+async def test_target_submission_routes_to_exact_non_browser_target():
+    config = Config.model_validate({
+        "targets": [{
+            "id": "api-one", "type": "openai_compatible", "base_url": "http://api.invalid/v1",
+            "api_key_env": "TEST_API_ONE", "model": "m1", "count": 2,
+        }],
+    })
+    store = TaskStore()
+    pool = WorkerPool(config, store, client=None, dispatch_interval=0.01)
+    task, reused = await pool.submit_with_metadata("API 任务", target_id="api-one")
+    assert reused is False
+    assert task.target_id == "api-one"
+    assert task.backend_type.value == "openai_compatible"
+    assert task.model == "m1"
+    assert pool.queue.qsize() == 1
+
+
+async def test_target_rejects_site_or_unauthorized_model_override():
+    config = Config.model_validate({
+        "targets": [{
+            "id": "api-one", "type": "openai_compatible", "base_url": "http://api.invalid/v1",
+            "api_key_env": "TEST_API_ONE", "model": "m1",
+        }],
+    })
+    pool = WorkerPool(config, TaskStore(), client=None)
+    with pytest.raises(ValueError, match="不能同时"):
+        await pool.submit_with_metadata("x", "kimi", target_id="api-one")
+    with pytest.raises(ValueError, match="不允许覆盖"):
+        await pool.submit_with_metadata("x", target_id="api-one", model="other")
 
 
 def test_find_idle_worker_关闭换站():

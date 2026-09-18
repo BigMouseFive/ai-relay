@@ -18,6 +18,7 @@ class FakePool:
         self.full = full
         self.daemon_ok = daemon_ok
         self.submitted = []
+        self.submitted_targets = []
 
     async def start(self):
         pass
@@ -31,6 +32,29 @@ class FakePool:
         task = self.store.create(prompt, site)
         self.submitted.append((prompt, site))
         return task.task_id
+
+    async def submit_with_metadata(self, prompt, site, *, target_id=None, routing_mode=None,
+                                   model=None, allow_fallback_sites=None, idempotency_key=None):
+        if self.full:
+            raise QueueFull("队列已满")
+        task, reused = self.store.create_or_get_idempotent(
+            prompt, site, target_id=target_id, model=model,
+            allow_fallback_sites=allow_fallback_sites, routing_mode=routing_mode,
+            idempotency_key=idempotency_key)
+        self.submitted.append((prompt, site))
+        self.submitted_targets.append(target_id)
+        return task, reused
+
+    def _enqueue_existing(self, task):
+        if self.full:
+            raise QueueFull("队列已满")
+
+    def cancel_task(self, task_id):
+        return False
+
+    @property
+    def workers(self):
+        return [type("Worker", (), {"site": "kimi"})()]
 
     def workers_info(self):
         return []
@@ -131,6 +155,21 @@ def test_查询任务_404(client):
     assert r.status_code == 404
 
 
+def test_list_tasks_filters_and_validates_time_range(client, store):
+    first = client.post("/api/tasks", json={"prompt": "筛选关键词"}).json()["task_id"]
+    second = client.post("/api/tasks", json={"prompt": "其他任务"}).json()["task_id"]
+    store.mark_done(first, "筛选结果")
+    store.mark_failed(second, "筛选错误")
+
+    body = client.get("/v1/tasks", params={"q": "筛选关键词"}).json()
+    assert body["total"] == 1
+    assert body["items"][0]["task_id"] == first
+    body = client.get("/v1/tasks", params={"status": "failed"}).json()
+    assert body["total"] == 1
+    assert body["items"][0]["task_id"] == second
+    assert client.get("/v1/tasks", params={"created_after": 2, "created_before": 1}).status_code == 422
+
+
 def test_stats(client, store):
     r = client.post("/api/tasks", json={"prompt": "s" * 200})
     task_id = r.json()["task_id"]
@@ -157,6 +196,64 @@ def test_stats_daemon异常(store):
 def test_health(client):
     body = client.get("/health").json()
     assert body == {"ok": True, "daemon_ok": True, "daemon_detail": "ok"}
+
+
+def test_v1_submit_requires_idempotency_key(client):
+    r = client.post("/v1/tasks", json={"prompt": "你好"})
+    assert r.status_code == 422
+
+
+def test_v1_submit_is_idempotent_and_emits_events(client):
+    headers = {"Idempotency-Key": "api-key-1"}
+    payload = {"prompt": "你好", "site": "kimi"}
+    first = client.post("/v1/tasks", json=payload, headers=headers)
+    second = client.post("/v1/tasks", json=payload, headers=headers)
+    assert first.status_code == 202
+    assert first.headers["location"] == f"/v1/tasks/{first.json()['task_id']}"
+    assert first.json()["reused"] is False
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["reused"] is True
+    events = client.get(f"/v1/tasks/{first.json()['task_id']}/events")
+    assert events.status_code == 200
+    assert events.json()[0]["event_type"] == "task_created"
+
+
+def test_v1_target_is_forwarded_to_pool(client, pool):
+    r = client.post("/v1/tasks", json={"prompt": "target", "target": "api-one"},
+                    headers={"Idempotency-Key": "target-key"})
+    assert r.status_code == 202
+    assert pool.submitted_targets == ["api-one"]
+
+
+def test_old_api_rejects_target(client):
+    r = client.post("/api/tasks", json={"prompt": "target", "target": "api-one"})
+    assert r.status_code == 422
+
+
+def test_v1_same_key_different_request_conflicts(client):
+    headers = {"Idempotency-Key": "api-key-conflict"}
+    assert client.post("/v1/tasks", json={"prompt": "一"}, headers=headers).status_code == 202
+    r = client.post("/v1/tasks", json={"prompt": "二"}, headers=headers)
+    assert r.status_code == 409
+
+
+def test_v1_cancel_queued_task(client):
+    headers = {"Idempotency-Key": "cancel-key"}
+    task_id = client.post("/v1/tasks", json={"prompt": "取消"}, headers=headers).json()["task_id"]
+    r = client.post(f"/v1/tasks/{task_id}/cancel")
+    assert r.status_code == 200
+    assert r.json()["cancel_requested"] is True
+
+
+def test_v1_routing_metrics_without_pool_support_returns_503(client):
+    r = client.get("/v1/routing/metrics")
+    assert r.status_code == 503
+
+
+def test_v1_capabilities(client):
+    body = client.get("/v1/capabilities").json()
+    assert body["max_prompt_chars"] == 12000
+    assert body["queue_max_size"] == 100
 
 
 def test_监控页(client):

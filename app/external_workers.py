@@ -1,0 +1,550 @@
+"""ACP 与 OpenAI-compatible 外部执行 worker。
+
+这两个 worker 只在被调度到对应 target 的任务运行时才启动子进程或发出 HTTP 请求。
+启动阶段仅做本机命令/环境变量配置检查，绝不主动调用模型。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import shutil
+import signal
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+import httpx
+
+from .config import AcpTargetConfig, OpenAICompatibleTargetConfig
+from .schemas import BackendType, TaskPhase, TaskStatus, WorkerState
+from .store import TaskRecord, TaskStore
+
+logger = logging.getLogger("ai-relay.external-workers")
+
+
+class ExternalWorkerError(RuntimeError):
+    code = "external_error"
+    retryable = False
+    outcome_unknown = False
+
+
+class RetryableExternalWorkerError(ExternalWorkerError):
+    retryable = True
+
+
+class ExternalOutcomeUnknownError(ExternalWorkerError):
+    code = "external_outcome_unknown"
+    outcome_unknown = True
+
+
+class ExternalTaskCancelledError(ExternalWorkerError):
+    code = "cancelled"
+
+
+class AcpExecutionError(ExternalWorkerError):
+    code = "acp_execution_error"
+
+
+class AcpOutputLimitError(AcpExecutionError):
+    code = "acp_output_limit"
+
+
+class ApiResponseError(ExternalWorkerError):
+    def __init__(self, message: str, *, code: str, status_code: Optional[int] = None,
+                 retryable: bool = False, outcome_unknown: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.retryable = retryable
+        self.outcome_unknown = outcome_unknown
+
+
+@dataclass(frozen=True)
+class ExternalResult:
+    text: str
+    external_request_id: Optional[str] = None
+    process_exit_code: Optional[int] = None
+    provider_status_code: Optional[int] = None
+    usage: Optional[dict[str, Any]] = None
+
+
+RetryCallback = Callable[[TaskRecord, str, str], bool]
+
+
+class ExternalWorker:
+    """非浏览器 target 的统一执行生命周期。"""
+
+    backend_type: BackendType
+    site: Optional[str] = None
+
+    def __init__(self, worker_id: str, target_id: str, model: str, store: TaskStore,
+                 timeout_seconds: float, on_retry: RetryCallback) -> None:
+        self.worker_id = worker_id
+        self.target_id = target_id
+        self.model = model
+        self.store = store
+        self.timeout_seconds = timeout_seconds
+        self.on_retry = on_retry
+        self.state = WorkerState.starting
+        self.detail: Optional[str] = None
+        self.current_task_id: Optional[str] = None
+        self.done_count = 0
+        self.fail_count = 0
+        self._run_task: Optional[asyncio.Task] = None
+
+    def cancel_current_task(self) -> bool:
+        if self._run_task and not self._run_task.done():
+            self._run_task.cancel()
+            return True
+        return False
+
+    async def start(self) -> None:
+        self.state = WorkerState.starting
+        self.detail = None
+        try:
+            await self._validate_ready()
+        except Exception as error:
+            self._degrade(self._error_text(error))
+            return
+        self.state = WorkerState.idle
+        logger.info("worker %s 就绪（%s / %s）", self.worker_id,
+                    self.backend_type.value, self.model or "默认")
+
+    async def stop(self) -> None:
+        if self._run_task and not self._run_task.done():
+            self._run_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._run_task
+
+    def start_task(self, task: TaskRecord) -> None:
+        self.state = WorkerState.busy
+        self.current_task_id = task.task_id
+        self._run_task = asyncio.create_task(self.run_task(task))
+
+    async def run_task(self, task: TaskRecord) -> None:
+        try:
+            current = self.store.get(task.task_id)
+            if current is None or current.status != TaskStatus.running:
+                self.store.mark_running(
+                    task.task_id, worker_id=self.worker_id, actual_site=self.site,
+                    actual_target_id=self.target_id, actual_backend_type=self.backend_type,
+                )
+            self.store.start_attempt(
+                task.task_id, self.worker_id, self.site, self.model,
+                target_id=self.target_id, backend_type=self.backend_type,
+            )
+            current = self.store.get(task.task_id)
+            if current and current.cancel_requested:
+                raise ExternalTaskCancelledError("任务已请求取消")
+            async with asyncio.timeout(self.timeout_seconds):
+                result = await self._execute(task)
+        except asyncio.CancelledError:
+            current = self.store.get(task.task_id)
+            if current and current.cancel_requested:
+                with suppress(Exception):
+                    self.store.mark_cancelled(task.task_id, "用户请求取消")
+            else:
+                with suppress(Exception):
+                    self.store.mark_interrupted(task.task_id, "服务停止，外部执行中断")
+                self.fail_count += 1
+            raise
+        except ExternalOutcomeUnknownError as error:
+            with suppress(Exception):
+                self.store.mark_outcome_unknown(task.task_id, self._error_text(error))
+            self.fail_count += 1
+            logger.warning("任务 %s 外部执行结果未知: %s", task.task_id[:8], error)
+        except ExternalTaskCancelledError as error:
+            with suppress(Exception):
+                self.store.mark_cancelled(task.task_id, self._error_text(error))
+        except asyncio.TimeoutError:
+            # timeout 期间请求/CLI 可能已经接收 prompt，不能盲目重发。
+            with suppress(Exception):
+                self.store.mark_outcome_unknown(task.task_id, "外部执行端到端超时")
+            self.fail_count += 1
+        except ExternalWorkerError as error:
+            if isinstance(error, ApiResponseError) and error.status_code is not None:
+                with suppress(Exception):
+                    self.store.update_attempt(task.task_id, provider_status_code=error.status_code)
+            await self._handle_external_error(task, error)
+        except Exception as error:
+            await self._handle_external_error(
+                task, ExternalWorkerError(self._error_text(error)))
+        else:
+            try:
+                self.store.mark_done(
+                    task.task_id, result.text,
+                    external_request_id=result.external_request_id,
+                    process_exit_code=result.process_exit_code,
+                    provider_status_code=result.provider_status_code,
+                    usage=result.usage,
+                )
+            except Exception as error:
+                with suppress(Exception):
+                    self.store.mark_outcome_unknown(
+                        task.task_id, f"外部结果已获取但持久化失败: {self._error_text(error)}")
+                self._degrade(f"任务完成状态持久化失败: {self._error_text(error)}")
+                self.fail_count += 1
+            else:
+                self.done_count += 1
+                logger.info("任务 %s 外部执行完成（worker %s，答案 %d 字）",
+                            task.task_id[:8], self.worker_id, len(result.text))
+        finally:
+            self.current_task_id = None
+            if self.state == WorkerState.busy:
+                self.state = WorkerState.idle
+
+    async def _handle_external_error(self, task: TaskRecord, error: ExternalWorkerError) -> None:
+        code = getattr(error, "code", "external_error")
+        if getattr(error, "outcome_unknown", False):
+            with suppress(Exception):
+                self.store.mark_outcome_unknown(task.task_id, self._error_text(error))
+            self.fail_count += 1
+            return
+        if getattr(error, "retryable", False):
+            if self.on_retry(task, self._error_text(error), code):
+                return
+        with suppress(Exception):
+            self.store.mark_failed(task.task_id, self._error_text(error), error_code=code)
+        self.fail_count += 1
+
+    def _degrade(self, detail: str) -> None:
+        self.state = WorkerState.degraded
+        self.detail = detail
+        logger.warning("worker %s 进入异常状态: %s", self.worker_id, detail)
+
+    async def _validate_ready(self) -> None:
+        raise NotImplementedError
+
+    async def _execute(self, task: TaskRecord) -> ExternalResult:
+        raise NotImplementedError
+
+    @staticmethod
+    def _error_text(error: BaseException) -> str:
+        return str(error) or type(error).__name__
+
+
+class AcpWorker(ExternalWorker):
+    backend_type = BackendType.acp
+
+    def __init__(self, worker_id: str, target: AcpTargetConfig, store: TaskStore,
+                 default_timeout_seconds: float, on_retry: RetryCallback) -> None:
+        super().__init__(
+            worker_id, target.id, target.model, store,
+            target.timeout_seconds or default_timeout_seconds, on_retry,
+        )
+        self.target = target
+        self._active_process: Optional[asyncio.subprocess.Process] = None
+        self._resolved_command: Optional[str] = None
+
+    def _resolve_command(self) -> str:
+        command = os.path.expanduser(self.target.command)
+        if os.path.isabs(command) or os.sep in command:
+            if os.path.isfile(command) and os.access(command, os.X_OK):
+                return command
+            raise AcpExecutionError(f"ACP 命令不可执行: {command}")
+        candidates = [
+            shutil.which(command),
+            os.path.expanduser(f"~/.local/bin/{command}"),
+            os.path.expanduser(f"~/.cursor/bin/{command}"),
+            f"/opt/homebrew/bin/{command}",
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        raise AcpExecutionError(
+            f"ACP 命令不可用: {self.target.command}（当前服务 PATH 未找到；可配置绝对路径）")
+
+    async def _validate_ready(self) -> None:
+        self._resolved_command = self._resolve_command()
+        path = os.path.abspath(os.path.expanduser(self.target.working_directory))
+        if not os.path.isdir(path):
+            raise AcpExecutionError(f"ACP 工作目录不存在: {path}")
+        if self.target.api_key_env and not os.environ.get(self.target.api_key_env):
+            raise AcpExecutionError(
+                f"ACP API key 环境变量未设置: {self.target.api_key_env}")
+        self._working_directory = path
+        if self.target.verify_auth_on_start:
+            await self._verify_auth()
+
+    async def _verify_auth(self) -> None:
+        """只读预检 Cursor 登录/Keychain 状态；不创建聊天、不提交 prompt。"""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._resolved_command or self.target.command, "status", cwd=self._working_directory,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=self._child_env(),
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self.target.auth_check_timeout_seconds)
+        except (OSError, asyncio.TimeoutError) as error:
+            raise AcpExecutionError(f"ACP 认证预检失败: {error}") from error
+        if process.returncode != 0:
+            detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+            if "keychain is locked" in detail.lower():
+                raise AcpExecutionError("ACP Keychain 已锁定，请先解锁登录钥匙串")
+            raise AcpExecutionError(f"ACP 认证预检失败: {detail or f'退出码 {process.returncode}'}")
+
+    async def stop(self) -> None:
+        if self._active_process and self._active_process.returncode is None:
+            await self._terminate_process(self._active_process)
+        await super().stop()
+
+    async def _execute(self, task: TaskRecord) -> ExternalResult:
+        await self._check_cancel(task)
+        self.store.set_phase(task.task_id, TaskPhase.sending)
+        self.store.update_attempt(task.task_id, phase=TaskPhase.sending, send_state="sending")
+
+        argv = self._build_argv(task.prompt)
+        stdin: Optional[int] = None
+        input_data: Optional[bytes] = None
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=self._working_directory,
+                stdin=stdin,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                # 明确最小环境，不传入 host 全量 secrets；仅可选映射一个 Cursor key。
+                env=self._child_env(),
+            )
+        except FileNotFoundError as error:
+            self._degrade(f"ACP 命令不可用: {self.target.command}")
+            raise AcpExecutionError(f"ACP 命令不可用: {self.target.command}") from error
+        except OSError as error:
+            raise RetryableExternalWorkerError(f"ACP 子进程无法启动: {error}") from error
+
+        self._active_process = process
+        self.store.set_phase(task.task_id, TaskPhase.generating)
+        self.store.update_attempt(task.task_id, phase=TaskPhase.generating,
+                                  send_state="sent_confirmed")
+        try:
+            stdout, stderr = await self._communicate_limited(process, input_data)
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            raise
+        finally:
+            self._active_process = None
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip() or "无 stderr 输出"
+            self.store.update_attempt(task.task_id, process_exit_code=process.returncode)
+            # CLI 已启动并接收 prompt 后的非零退出无法证明没有副作用，绝不自动重放。
+            raise ExternalOutcomeUnknownError(f"ACP 退出码 {process.returncode}: {detail}")
+        text = stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            raise AcpExecutionError("ACP 未返回文本结果")
+        return ExternalResult(text=text, process_exit_code=process.returncode)
+
+    def _build_argv(self, prompt: str) -> list[str]:
+        """构建 Cursor Agent CLI 的非交互、只读命令，不经 shell。"""
+        argv = [self._resolved_command or self.target.command, *self.target.args, "--print",
+                "--output-format", self.target.output_format,
+                "--mode", self.target.mode]
+        if self.target.endpoint:
+            argv.extend(["--endpoint", self.target.endpoint])
+        if self.target.trust_workspace:
+            argv.append("--trust")
+        if self.target.pass_workspace:
+            argv.extend(["--workspace", self._working_directory])
+        if self.model:
+            argv.extend(["--model", self.model])
+        argv.append(prompt)
+        return argv
+
+    def _child_env(self) -> dict[str, str]:
+        env = {key: value for key, value in os.environ.items()
+               if key in {"HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"}}
+        if self.target.api_key_env:
+            key = os.environ.get(self.target.api_key_env)
+            if not key:
+                raise AcpExecutionError(
+                    f"ACP API key 环境变量未设置: {self.target.api_key_env}")
+            env["CURSOR_API_KEY"] = key
+        return env
+
+    async def _communicate_limited(self, process: asyncio.subprocess.Process,
+                                   input_data: Optional[bytes]) -> tuple[bytes, bytes]:
+        """边读边限流，避免无限 stdout/stderr 撑爆 relay 内存。"""
+        if input_data is not None and process.stdin:
+            process.stdin.write(input_data)
+            await process.stdin.drain()
+            process.stdin.close()
+        assert process.stdout is not None and process.stderr is not None
+
+        async def read_limited(stream: asyncio.StreamReader) -> bytes:
+            chunks: list[bytes] = []
+            size = 0
+            while chunk := await stream.read(64 * 1024):
+                size += len(chunk)
+                if size > self.target.output_max_chars:
+                    raise ExternalOutcomeUnknownError(
+                        f"ACP 输出超过上限 {self.target.output_max_chars} 字节，已拒绝保存不完整结果")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        readers = [asyncio.create_task(read_limited(process.stdout)),
+                   asyncio.create_task(read_limited(process.stderr))]
+        try:
+            stdout, stderr = await asyncio.gather(*readers)
+        except Exception:
+            await self._terminate_process(process)
+            await asyncio.gather(*readers, return_exceptions=True)
+            raise
+        await process.wait()
+        return stdout, stderr
+
+    async def _check_cancel(self, task: TaskRecord) -> None:
+        current = self.store.get(task.task_id)
+        if current and current.cancel_requested:
+            raise ExternalTaskCancelledError("任务已请求取消")
+
+    async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        with suppress(ProcessLookupError):
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGTERM)
+            else:  # pragma: no cover - macOS/Linux 都会走上方分支
+                process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self.target.graceful_shutdown_seconds)
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                if hasattr(os, "killpg"):
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:  # pragma: no cover
+                    process.kill()
+            with suppress(Exception):
+                await process.wait()
+
+
+class OpenAICompatibleWorker(ExternalWorker):
+    backend_type = BackendType.openai_compatible
+
+    def __init__(self, worker_id: str, target: OpenAICompatibleTargetConfig, store: TaskStore,
+                 default_timeout_seconds: float, on_retry: RetryCallback) -> None:
+        super().__init__(
+            worker_id, target.id, target.model, store,
+            target.timeout_seconds or default_timeout_seconds, on_retry,
+        )
+        self.target = target
+        self._client: Optional[httpx.AsyncClient] = None
+        self._api_key: Optional[str] = None
+
+    async def _validate_ready(self) -> None:
+        key = os.environ.get(self.target.api_key_env)
+        if not key:
+            raise ExternalWorkerError(
+                f"API key 环境变量未设置: {self.target.api_key_env}")
+        self._api_key = key
+        self._client = httpx.AsyncClient(
+            base_url=self.target.base_url.rstrip("/"),
+            timeout=self.timeout_seconds,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+
+    async def stop(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+        await super().stop()
+
+    async def _execute(self, task: TaskRecord) -> ExternalResult:
+        if not self._client or not self._api_key:
+            raise ExternalWorkerError("OpenAI-compatible client 未初始化")
+        current = self.store.get(task.task_id)
+        if current and current.cancel_requested:
+            raise ExternalTaskCancelledError("任务已请求取消")
+
+        model = task.model or self.target.model
+        # task.model 总会持久化最终模型；只有与 target 默认模型不同才属于调用方覆盖。
+        is_override = bool(task.model and task.model != self.target.model)
+        if is_override and not self.target.allow_model_override:
+            raise ExternalWorkerError("该 API target 不允许覆盖模型")
+        if is_override and task.model not in self.target.allowed_models:
+            raise ExternalWorkerError(f"请求模型不在 allowlist: {task.model}")
+
+        self.store.set_phase(task.task_id, TaskPhase.sending)
+        self.store.update_attempt(task.task_id, phase=TaskPhase.sending, send_state="sending")
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": task.prompt}],
+            "stream": False,
+        }
+        if self.target.max_output_tokens:
+            body["max_tokens"] = self.target.max_output_tokens
+        headers = {"Idempotency-Key": task.task_id}
+        try:
+            # 使用相对路径，保留 base_url 中的 /v1 前缀。
+            response = await self._client.post("chat/completions", json=body, headers=headers)
+        except httpx.ConnectError as error:
+            raise RetryableExternalWorkerError(f"API 连接失败: {error}") from error
+        except httpx.ConnectTimeout as error:
+            raise RetryableExternalWorkerError(f"API 连接超时: {error}") from error
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError) as error:
+            raise ExternalOutcomeUnknownError(f"API 请求已发出但响应不确定: {error}") from error
+        except httpx.HTTPError as error:
+            raise ExternalOutcomeUnknownError(f"API 请求状态不确定: {error}") from error
+
+        request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
+        if response.status_code in {408, 409, 425, 429}:
+            raise ApiResponseError(
+                self._response_error(response), code="api_retryable_status",
+                status_code=response.status_code, retryable=True,
+            )
+        if response.status_code >= 500:
+            raise ApiResponseError(
+                self._response_error(response), code="api_server_error",
+                status_code=response.status_code,
+                retryable=self.target.retry_server_errors,
+                outcome_unknown=not self.target.retry_server_errors,
+            )
+        if response.status_code >= 400:
+            code = "api_auth_error" if response.status_code in {401, 403} else "api_request_error"
+            raise ApiResponseError(self._response_error(response), code=code,
+                                   status_code=response.status_code)
+        try:
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            text = self._content_to_text(content)
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise ApiResponseError(f"API 响应格式无效: {error}", code="api_invalid_response",
+                                   status_code=response.status_code) from error
+        if not text.strip():
+            raise ApiResponseError("API 返回空回答", code="api_empty_response",
+                                   status_code=response.status_code)
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+        external_id = str(data.get("id")) if data.get("id") else request_id
+        self.store.set_phase(task.task_id, TaskPhase.collecting_result)
+        return ExternalResult(
+            text=text, external_request_id=external_id,
+            provider_status_code=response.status_code, usage=usage,
+        )
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "".join(parts)
+        raise TypeError("message.content 不是 string 或内容块数组")
+
+    @staticmethod
+    def _response_error(response: httpx.Response) -> str:
+        try:
+            data = response.json()
+            error = data.get("error", data)
+            if isinstance(error, dict):
+                return str(error.get("message") or error)
+        except ValueError:
+            pass
+        return f"API HTTP {response.status_code}"

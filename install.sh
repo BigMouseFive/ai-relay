@@ -11,6 +11,8 @@
 # - kimi-webbridge 是本服务的硬依赖（驱动真实浏览器），脚本会自动安装并启动
 # - 浏览器扩展与站点登录无法自动化，脚本会给出指引
 set -euo pipefail
+# 配置、SQLite 和日志可能含有 prompt/result 或 ERP token。
+umask 077
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$PROJECT_DIR/.venv"
@@ -29,10 +31,22 @@ case "$OS" in
   *) err "不支持的操作系统: $OS（仅支持 macOS 与 Ubuntu）"; exit 1 ;;
 esac
 
-config_port() {
-  grep -E '^\s*port:' "$CONFIG" | head -1 | awk '{print $2}' || echo 8600
+ensure_config() {
+  if [[ -f "$CONFIG" ]]; then
+    return
+  fi
+  if [[ ! -f "$PROJECT_DIR/config.example.yaml" ]]; then
+    err "缺少 config.yaml 和 config.example.yaml"; exit 1
+  fi
+  cp "$PROJECT_DIR/config.example.yaml" "$CONFIG"
+  chmod 600 "$CONFIG"
+  warn "已从 config.example.yaml 创建 $CONFIG，请按实际浏览器登录和 ERP 环境检查后重新运行安装。"
+  exit 1
 }
-PORT="$(config_port)"; PORT="${PORT:-8600}"
+
+config_port() {
+  "$VENV/bin/python" -c 'from app.config import load_config; import sys; print(load_config(sys.argv[1]).server.port)' "$CONFIG" 2>/dev/null || echo 8600
+}
 
 uninstall() {
   log "卸载 ai-relay 服务（保留代码与 .venv）..."
@@ -99,7 +113,16 @@ log "准备 Python 虚拟环境 ..."
 "$VENV/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt"
 log "依赖安装完成"
 
-mkdir -p "$PROJECT_DIR/logs"
+ensure_config
+if ! "$VENV/bin/python" -c 'from app.config import load_config; import sys; load_config(sys.argv[1])' "$CONFIG"; then
+  err "配置校验失败，请修复后重新运行安装: $CONFIG"
+  exit 1
+fi
+PORT="$(config_port)"; PORT="${PORT:-8600}"
+
+mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/data"
+chmod 700 "$PROJECT_DIR/logs" "$PROJECT_DIR/data"
+chmod 600 "$CONFIG"
 
 # ============ 4. 注册开机自启并启动 ============
 if [[ "$PLATFORM" == "mac" ]]; then

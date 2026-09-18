@@ -51,32 +51,78 @@ python3 -m venv .venv
 
 监控页：http://127.0.0.1:8600/ （每 2 秒自动刷新）
 
-监控页顶部带**创建任务（调试）**面板：输入提示词、选站点（任意/kimi/deepseek）、点提交即可创建任务，提交后下方卡片实时跟踪状态，完成后直接显示结果，无需 curl 即可调试。
+监控页顶部带**创建任务（调试）**面板：站点选项由服务端已配置 worker 动态提供（含 MiniMax）；页面以幂等键提交、展示请求/实际站点、重试次数、当前阶段和完整任务详情。页面提交会向已登录的真实第三方 AI 网页发送内容。
 
 ## 配置（config.yaml）
 
+完整模板见 [`config.example.yaml`](config.example.yaml)。新部署统一使用 `targets`；旧 `workers` 浏览器配置仍兼容，并会自动转换为 WebBridge target。每种后端都可配置多个 target，每条的 `count` 是独立并发槽数。关键项：
+
 ```yaml
-server:
-  host: 127.0.0.1   # 局域网接入 ERP 时需改为 0.0.0.0
-  port: 8600
 webbridge:
-  base_url: http://127.0.0.1:10086
+  command_timeout_seconds: 60
+  status_timeout_seconds: 5
 workers:
-  - site: kimi          # kimi 或 deepseek
-    model: "K2.6"       # kimi: 模型名子串，可选 "K3 · Max"/"K3 集群 · Max"/"K2.6 · Fast"
-    count: 1            # 该站点开几个 tab
-  - site: deepseek
-    model: "深度思考"    # deepseek: 开关名子串；"深度思考"=开深度思考，"" = 普通模式
+  - site: kimi              # kimi | deepseek | minimax
+    model: "K2.6"
     count: 1
 task:
-  timeout_seconds: 600      # 单任务最长执行时间
-  retention_seconds: 3600   # 已完成任务结果保留时长
-  max_prompt_chars: 12000   # 超过返回 422
-queue:
-  max_size: 100             # 排队上限，满了返回 429
-dashboard:
-  history_size: 100         # 监控页最近任务条数
+  timeout_seconds: 600       # 每个 attempt 的端到端上限
+  stall_seconds: 120         # 回答文本无进展上限
+  hard_timeout_seconds: 300
+  max_retries: 3             # 仅发送前失败允许自动重试
+  retry_switch_site: false   # 默认不把同一 prompt 发往其他站点
+  max_queue_wait_seconds: 3600
+  retry_initial_delay_seconds: 3
+  retry_max_delay_seconds: 60
+storage:
+  terminal_retention_seconds: 2592000  # 30 天后清除 prompt/result
+  metadata_retention_seconds: 7776000  # 90 天后删除终态任务元数据
 ```
+
+- 配置字段严格校验：未知字段、未知站点、无 worker、非正的队列/超时配置会拒绝启动。
+- `hard_timeout_seconds` 与 `stall_seconds` 不得大于 `timeout_seconds`。
+- 同一 SQLite 数据库只能由一个 relay 实例使用；第二实例会拒绝启动，避免争用浏览器 session。
+- API key 不写入 YAML：默认从与 `config.yaml` 同目录的 `.env` 加载（例如 `AI_RELAY_INTERNAL_OPENAI_API_KEY='...'`），或由 launchd/systemd 注入同名环境变量；后者优先。`.env` 已被忽略且应设置为 `0600`。
+
+### 执行后端：WebBridge、ACP、OpenAI-compatible API
+
+`targets` 支持三种类型：
+
+```yaml
+targets:
+  - id: kimi-browser-fast
+    type: webbridge
+    site: kimi
+    model: "K2.6"
+    count: 2
+
+  - id: cursor-agent-project-a
+    type: acp
+    command: agent
+    working_directory: "../project-a"
+    mode: ask                    # ask | plan；均为只读模式
+    output_format: text          # text | json | stream-json
+    trust_workspace: true
+    count: 2
+    timeout_seconds: 600
+
+  - id: internal-openai-default
+    type: openai_compatible
+    base_url: "http://10.67.8.60:18080/v1"
+    api_key_env: AI_RELAY_INTERNAL_OPENAI_API_KEY
+    model: "gpt-5.6-terra"
+    count: 4
+    timeout_seconds: 120
+    max_retries: 2
+    retry_server_errors: false   # 默认：5xx 结果未知，不自动重发
+```
+
+- **ACP / Cursor Agent CLI**：当前机器已确认 CLI 版本为 `2026.09.10-fd3934a`，非交互命令为 `agent --print --output-format text --mode ask --workspace <dir> <prompt>`。每个并发槽启动独立子进程组，绝不使用 `shell=True`；默认 `ask` / `plan` 都是只读模式，不会传 `--force` 或 `--yolo`；取消时先 SIGTERM 再 SIGKILL，stdout/stderr 有上限。`agent status` 已确认当前用户已登录。若服务环境仍无法使用 Keychain，可在 ACP target 设置 `api_key_env: CURSOR_API_KEY`，relay 只把该变量映射为子进程的 `CURSOR_API_KEY`，不放进进程参数或日志。
+- **OpenAI-compatible API**：调用 `{base_url}/chat/completions`，使用 Bearer key 与 relay task ID 作为 `Idempotency-Key`。API key 只从 `api_key_env` 环境变量读取。`base_url` 必须包含版本前缀（如 `/v1`）。
+- `target` 是 `/v1/tasks` 推荐的精确路由字段；指定 target 后不会自动跨到 ACP/API/浏览器的其他 target。
+- 未指定 target 的旧调用只会调度 WebBridge browser target，绝不会意外发送到 ACP 或 API。
+- API 5xx、读超时、ACP 子进程非零退出等“可能已经接收 prompt”的情况会进入 `outcome_unknown`，不会自动重复执行。
+- `./install.sh` 发现缺少 `config.yaml` 时会按 `config.example.yaml` 创建一个权限为 `0600` 的模板并退出，供你检查后再次安装。
 
 配置路径可用环境变量覆盖：`AI_RELAY_CONFIG=/path/to/config.yaml`
 
@@ -101,43 +147,62 @@ erp:
 
 ## API
 
-### 提交任务
+### 推荐：幂等提交（v1）
 
 ```bash
-curl -X POST http://127.0.0.1:8600/api/tasks \
+curl -X POST http://127.0.0.1:8600/v1/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"prompt": "用一句话解释量子计算", "site": "kimi"}'
-# => {"task_id": "55d39ef0..."}
+  -H 'Idempotency-Key: 5c0f1555-7f55-4b0c-9b47-unique-per-logical-request' \
+  -d '{"prompt":"用一句话解释量子计算","target":"kimi-browser-fast"}'
+# => 202 Accepted
+# Location: /v1/tasks/<task_id>
 ```
 
-- `prompt` 必填；`site` 可选 `"kimi"` / `"deepseek"`，省略则由任一空闲 worker 执行
-- 错误：`422` 提示词为空或超长；`429` 队列已满
+`Idempotency-Key` 必填且必须由调用方为**同一个业务请求**稳定保存。请求或响应网络中断后，用相同 key 和相同 body（包括 `target`、`model`）重发，会返回同一任务；同 key 不同 body 返回 `409`，从而避免重复向真实 AI 网页或 API 发送内容。
 
-### 查询结果
+`GET /v1/tasks/{task_id}` 返回状态、阶段、实际站点、重试、尝试站点、结构化错误、完整 prompt/result 和 attempt 历史。状态包括：
 
-```bash
-curl http://127.0.0.1:8600/api/tasks/55d39ef0...
-```
+- `queued` / `retry_wait` / `running`：等待、延时重试、执行中；
+- `done`：已获取并稳定确认结果；
+- `failed` / `cancelled` / `expired` / `interrupted`：确定的终态；
+- `outcome_unknown`：发送 click 后发生超时或异常，**可能已经发送**。系统不会自动重放，请先检查 provider 历史，再由人工决定是否调用 retry。
 
-```json
-{
-  "task_id": "55d39ef0...",
-  "status": "done",            // queued | running | done | failed
-  "site": "kimi",
-  "prompt": "用一句话解释量子计算",
-  "result": "量子计算是……",     // done 时有值
-  "error": null,               // failed 时有原因
-  "elapsed_seconds": 10.8
-}
-```
+其他 v1 接口：
 
-注意：任务全量持久化在 SQLite（`data/ai-relay.db`），**服务重启后历史任务仍可按 id 查询、可分页浏览**；上次运行遗留的 queued/running 任务会在启动时标记为"服务重启，任务中断"。内存中的活跃任务副本默认保留 1 小时（SQLite 全量保留）。
+- `GET /v1/capabilities` — 已配置 site/model、可用 worker 和限制；
+- `GET /v1/tasks?page=&page_size=&status=` — 任务分页；非法状态返回 `422`；
+- `GET /v1/tasks/{task_id}/events` — 持久化状态事件；
+- `POST /v1/tasks/{task_id}/cancel` — queued/retry_wait 可取消；running 为协作式取消；
+- `POST /v1/tasks/{task_id}/retry` — 对终态任务显式人工重试，并重置排队截止时间。
 
-### 其他
+旧 `/api/tasks`、`/api/tasks/{id}`、`/api/stats` 保留作兼容接口；新客户端应使用 `/v1`。
 
-- `GET /api/stats` — 监控聚合数据（daemon 健康、worker 状态、队列快照、最近任务）
-- `GET /health` — 服务 + webbridge daemon 健康
-- `GET /` — 监控页面
+### 自适应路径选择
+
+`routing.default_mode: adaptive` 时，`POST /v1/tasks` 未指定 `target` 或 `site` 的新任务会在健康 target 中按权重随机选择；显式 `target` 永远优先，旧 `/api/tasks` 仍只走浏览器兼容路径。
+
+评分使用近 `window_seconds` 内、已完成的 attempt 元数据，不读取 prompt/result：
+
+- Beta 平滑成功率（低样本不会过度自信）；
+- 明确失败率；
+- `outcome_unknown` 比普通失败更高的惩罚；
+- 平均执行耗时（指数衰减）；
+- 当前 idle/total 容量；
+- 低样本 target 的 `exploration_weight`，避免新 target 永远拿不到样本。
+
+因此，如果 Kimi 在近期更慢、失败更多或产生更多结果未知，自动任务分配到其对应 target 的概率会降低；它不会被完全永久禁用，除非所有 worker 都是 `degraded`。可通过 `GET /v1/routing/metrics` 查看当前每个健康 target 的成功率、延迟、权重和概率；每个自动任务的候选权重也会写入 task event 和详情的 `routing_decision`。
+
+历史上没有 attempt 数据的旧任务不会参与评分；升级后的新任务开始积累样本。相同 `Idempotency-Key` 的 adaptive 重试固定复用第一次选择的 task/target，不会因为实时概率变化误创建或冲突。
+
+### 重启与数据保留
+
+任务、attempt、事件均先写入 SQLite 后才被接受。重启时：
+
+- 尚未进入浏览器的 `queued` / `retry_wait` 会恢复调度；
+- 正在执行的 `running` 会变为 `interrupted`，不会自动重复发送；
+- 已确认发送后结果未知的任务为 `outcome_unknown`，需要人工确认。
+
+终态任务默认 30 天后脱敏完整 prompt/result，90 天后删除任务元数据（均可配置）。SQLite 文件仍应纳入主机备份与容量监控。
 
 ## 站点适配说明
 

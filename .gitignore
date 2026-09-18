@@ -5,3 +5,8 @@ __pycache__/
 data/
 logs/
 config.yaml
+.env
+.env.*
+!.env.example
+.DS_Store
+.codegraph/

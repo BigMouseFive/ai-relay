@@ -8,7 +8,11 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 
-from ..webbridge import WebbridgeClient
+from ..webbridge import WebbridgeClient, WebbridgeError
+
+
+class SendOutcomeUnknownError(RuntimeError):
+    """发送 click 已发生，但无法可靠确认网页是否已接收该消息。"""
 
 
 class SiteAdapter(ABC):
@@ -32,15 +36,19 @@ class SiteAdapter(ABC):
 
     @abstractmethod
     async def send_prompt(self, prompt: str) -> None:
-        """填入提示词并发送。"""
+        """填入提示词并确认发送；click 后不确定性抛 SendOutcomeUnknownError。"""
 
     @abstractmethod
     async def poll_once(self) -> dict:
         """做一次 DOM 检查，返回 {"generating": bool, "answer": str | None}。"""
 
     async def _eval_json(self, code: str) -> dict:
-        """evaluate 一段返回 JSON 字符串的 JS 并解析。"""
-        raw = await self.client.evaluate(code, self.session)
-        if isinstance(raw, dict):
-            return raw
-        return json.loads(raw)
+        """evaluate 一段返回 JSON 字符串的 JS 并解析为对象。"""
+        try:
+            raw = await self.client.evaluate(code, self.session)
+            data = raw if isinstance(raw, dict) else json.loads(raw)
+        except Exception as e:
+            raise WebbridgeError(f"页面状态解析失败: {e}") from e
+        if not isinstance(data, dict):
+            raise WebbridgeError("页面状态解析失败: 返回值不是对象")
+        return data
