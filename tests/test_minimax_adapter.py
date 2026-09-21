@@ -3,6 +3,7 @@
 重点锁定：
 1. ensure_model 始终把 Agent 团队 / 思考两个开关保持关闭（先读状态，开才点）
 2. send_prompt 发送确认不得误点（stop-button 出现即视为已发送）
+3. 完成摘要优先于页面长期保留的 stop-button
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import json
 
 import pytest
 
-from app.sites.minimax import MinimaxAdapter
+from app.sites.minimax import MinimaxAdapter, _POLL_JS
 from app.webbridge import WebbridgeError
 
 
@@ -102,3 +103,8 @@ async def test_poll_once_passes_through():
     adapter = _adapter(client)
     snap = await adapter.poll_once()
     assert snap == {"generating": False, "answer": "42", "error": None}
+
+
+def test_poll_script_prefers_completion_summary_over_persistent_stop_button():
+    assert "turn-process-disclosure" in _POLL_JS
+    assert "&& !completed" in _POLL_JS

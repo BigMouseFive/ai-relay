@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   usage_json             TEXT,
   routing_mode           TEXT,
   routing_decision_json  TEXT,
+  response_format_json   TEXT,
+  max_retries            INTEGER,
   updated_at             REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
@@ -106,6 +108,8 @@ _MIGRATIONS = (
     ("usage_json", "ALTER TABLE tasks ADD COLUMN usage_json TEXT"),
     ("routing_mode", "ALTER TABLE tasks ADD COLUMN routing_mode TEXT"),
     ("routing_decision_json", "ALTER TABLE tasks ADD COLUMN routing_decision_json TEXT"),
+    ("response_format_json", "ALTER TABLE tasks ADD COLUMN response_format_json TEXT"),
+    ("max_retries", "ALTER TABLE tasks ADD COLUMN max_retries INTEGER"),
     ("updated_at", "ALTER TABLE tasks ADD COLUMN updated_at REAL NOT NULL DEFAULT 0"),
 )
 
@@ -115,7 +119,8 @@ _TASK_COLUMNS = (
     "request_hash", "phase", "error_code", "next_attempt_at", "queue_deadline_at",
     "cancel_requested", "current_attempt_id", "requested_model", "allow_fallback_sites",
     "target_id", "actual_target_id", "backend_type", "actual_backend_type",
-    "upstream_request_id", "usage_json", "routing_mode", "routing_decision_json", "updated_at",
+    "upstream_request_id", "usage_json", "routing_mode", "routing_decision_json",
+    "response_format_json", "max_retries", "updated_at",
 )
 
 _lock = threading.RLock()
@@ -238,6 +243,8 @@ def _normalise_record(rec: dict[str, Any]) -> dict[str, Any]:
     value.setdefault("usage_json", None)
     value.setdefault("routing_mode", None)
     value.setdefault("routing_decision_json", None)
+    value.setdefault("response_format_json", None)
+    value.setdefault("max_retries", None)
     value.setdefault("updated_at", now)
     value.setdefault("retries", 0)
     value.setdefault("tried_sites", None)
@@ -422,7 +429,7 @@ def target_attempt_metrics(since: float) -> dict[str, dict[str, float]]:
         rows = _required_conn().execute(
             "SELECT a.target_id, "
             "COUNT(*) AS attempts, "
-            "SUM(CASE WHEN t.status = 'done' AND t.actual_target_id = a.target_id THEN 1 ELSE 0 END) AS successes, "
+            "SUM(CASE WHEN a.error_code IS NULL AND a.finished_at IS NOT NULL THEN 1 ELSE 0 END) AS successes, "
             "SUM(CASE WHEN a.error_code IS NOT NULL AND a.error_code != 'send_outcome_unknown' THEN 1 ELSE 0 END) AS failures, "
             "SUM(CASE WHEN a.error_code = 'send_outcome_unknown' OR t.status = 'outcome_unknown' THEN 1 ELSE 0 END) AS unknowns, "
             "AVG(CASE WHEN a.finished_at IS NOT NULL THEN MAX(0, a.finished_at - a.started_at) END) AS avg_latency_seconds "

@@ -34,16 +34,26 @@ class AdaptiveRouter:
         self.config = config
         self._rng = rng or random.Random()
 
-    def rank(self, workers: Iterable[WorkerInfo]) -> list[TargetDecision]:
+    def rank(
+        self, workers: Iterable[WorkerInfo], *, require_idle: bool = False,
+        allowed_targets: Iterable[str] | None = None,
+        max_in_flight_per_target: int | None = None,
+    ) -> list[TargetDecision]:
         grouped: dict[str, list[WorkerInfo]] = {}
         for worker in workers:
             grouped.setdefault(worker.target_id, []).append(worker)
+        allowed = set(allowed_targets) if allowed_targets is not None else None
 
         # 完全 degraded 的 target 不参与自动选择；starting/idle/busy 都可参与。
         eligible = {
             target_id: slots
             for target_id, slots in grouped.items()
-            if any(slot.state != WorkerState.degraded for slot in slots)
+            if (allowed is None or target_id in allowed)
+            and any(slot.state != WorkerState.degraded for slot in slots)
+            and (not require_idle or any(slot.state == WorkerState.idle for slot in slots))
+            and (max_in_flight_per_target is None
+                 or sum(slot.state == WorkerState.busy for slot in slots)
+                 < max_in_flight_per_target)
         }
         if not eligible:
             raise ValueError("没有可用于自适应路由的健康 target")
@@ -51,8 +61,16 @@ class AdaptiveRouter:
         return [self._score(target_id, slots, metrics.get(target_id, {}))
                 for target_id, slots in sorted(eligible.items())]
 
-    def choose(self, workers: Iterable[WorkerInfo]) -> TargetDecision:
-        decisions = self.rank(workers)
+    def choose(
+        self, workers: Iterable[WorkerInfo], *, require_idle: bool = False,
+        allowed_targets: Iterable[str] | None = None,
+        max_in_flight_per_target: int | None = None,
+        task_policy: str | None = None,
+    ) -> TargetDecision:
+        allowed = tuple(allowed_targets) if allowed_targets is not None else None
+        decisions = self.rank(
+            workers, require_idle=require_idle, allowed_targets=allowed,
+            max_in_flight_per_target=max_in_flight_per_target)
         total = sum(decision.weight for decision in decisions)
         selected = decisions[-1]
         threshold = self._rng.random() * total
@@ -74,6 +92,12 @@ class AdaptiveRouter:
                 for decision in decisions
             ],
         }
+        if task_policy is not None:
+            details.update({
+                "task_policy": task_policy,
+                "allowed_targets": list(allowed or ()),
+                "max_in_flight_per_target": max_in_flight_per_target,
+            })
         return TargetDecision(selected.target_id, selected.weight, details)
 
     def _score(self, target_id: str, slots: list[WorkerInfo], metrics: dict[str, float]) -> TargetDecision:

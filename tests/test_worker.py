@@ -56,6 +56,33 @@ class StallThenAnswerAdapter:
         return {"generating": True, "answer": None, "error": None}
 
 
+class AlwaysGeneratingStableJsonAdapter:
+    """生成标志不消失，但已经连续读到通过 Schema 的完整稳定 JSON。"""
+
+    home_url = "http://fake.local/"
+    session = "fake-session"
+
+    def __init__(self):
+        self.client = FakeClient()
+        self.sent = False
+
+    async def new_chat(self):
+        pass
+
+    async def send_prompt(self, prompt):
+        self.sent = True
+
+    async def ensure_model(self, model):
+        pass
+
+    async def is_logged_in(self):
+        return True
+
+    async def poll_once(self):
+        answer = '{"ok":true}' if self.sent else None
+        return {"generating": True, "answer": answer, "error": None}
+
+
 class AlwaysGeneratingAdapter:
     """永远 generating=True，用于验证硬超时不信任该指示。"""
 
@@ -111,6 +138,37 @@ async def test_persistent_stall_becomes_outcome_unknown():
     rec = w.store.get(task.task_id)
     assert rec.status.value == "outcome_unknown"
     assert "停滞" in (rec.error or "")
+
+
+async def test_stable_schema_valid_answer_finishes_when_site_indicator_stays_generating(monkeypatch):
+    monkeypatch.setattr(worker_mod, "PAGE_LOAD_WAIT", 0)
+    monkeypatch.setattr(worker_mod, "POLL_INTERVAL", 0.01)
+
+    store = TaskStore(history_size=10, retention_seconds=60)
+    adapter = AlwaysGeneratingStableJsonAdapter()
+    w = Worker(
+        "w1", "minimax", "", adapter, store,
+        timeout_seconds=60, stall_seconds=60, hard_timeout_seconds=10,
+    )
+    task = store.create(
+        "return json", None,
+        response_format={
+            "type": "json_schema",
+            "name": "stable-json",
+            "schema": {
+                "type": "object",
+                "required": ["ok"],
+                "properties": {"ok": {"const": True}},
+                "additionalProperties": False,
+            },
+        },
+    )
+
+    await w.run_task(task)
+
+    rec = store.get(task.task_id)
+    assert rec.status.value == "done"
+    assert rec.result == '{"ok":true}'
 
 
 async def test_hard_timeout_after_confirmed_send_becomes_outcome_unknown(monkeypatch):

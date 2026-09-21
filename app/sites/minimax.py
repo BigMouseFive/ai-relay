@@ -12,12 +12,16 @@ logger = logging.getLogger("ai-relay.minimax")
 
 _POLL_JS = """
 (() => {
-  const generating = !!document.querySelector('[data-testid="stop-button"]');
   const items = [...document.querySelectorAll('[data-testid="message-item"]')]
     .filter(i => i.querySelector('[data-testid="assistant-active-flow"]'));
   const last = items[items.length - 1];
   const text = last
     ? last.querySelector('[data-testid="assistant-active-flow"]').innerText.trim() : null;
+  // MiniMax 实测在回答完成后仍可能长期保留 stop-button；当前消息出现
+  // “共执行 N 秒”的 turn-process-disclosure 才是可靠完成标志。
+  const completed = !!last?.querySelector('[data-testid="turn-process-disclosure"]')
+    || !!document.querySelector('[data-testid="turn-process-disclosure"]');
+  const generating = !!document.querySelector('[data-testid="stop-button"]') && !completed;
   return JSON.stringify({ generating, answer: text, error: null });
 })()
 """

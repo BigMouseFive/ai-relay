@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import db as task_db
+from .response_contract import provider_prompt, validate_result
 from .schemas import BackendType, TaskAttemptInfo, TaskInfo, TaskPhase, TaskStatus, TaskSummary
 
 PREVIEW_CHARS = 120
@@ -45,11 +46,13 @@ def _backend_type(value: Optional[str]) -> Optional[BackendType]:
 
 def request_hash(prompt: str, site: Optional[str], target_id: Optional[str],
                  backend_type: Optional[str], model: Optional[str],
-                 allow_fallback_sites: Optional[bool], routing_mode: Optional[str]) -> str:
+                 allow_fallback_sites: Optional[bool], routing_mode: Optional[str],
+                 response_format: Optional[dict[str, Any]], max_retries: Optional[int]) -> str:
     payload = json.dumps({
         "prompt": prompt, "site": site, "target_id": target_id,
         "backend_type": backend_type, "model": model,
         "allow_fallback_sites": allow_fallback_sites, "routing_mode": routing_mode,
+        "response_format": response_format, "max_retries": max_retries,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -88,7 +91,13 @@ class TaskRecord:
     usage: Optional[dict[str, Any]] = None
     routing_mode: Optional[str] = None
     routing_decision: Optional[dict[str, Any]] = None
+    response_format: Optional[dict[str, Any]] = None
+    max_retries: Optional[int] = None
     updated_at: float = field(default_factory=time.time)
+
+    def execution_prompt(self) -> str:
+        """真实下发到 provider 的 prompt；原始业务 prompt 始终单独持久化。"""
+        return provider_prompt(self.prompt, self.response_format)
 
     def elapsed_seconds(self) -> Optional[float]:
         if self.started_at is None:
@@ -110,6 +119,7 @@ class TaskRecord:
             backend_type=self.backend_type, actual_backend_type=self.actual_backend_type,
             upstream_request_id=self.upstream_request_id, usage=self.usage,
             routing_mode=self.routing_mode, routing_decision=self.routing_decision,
+            response_format=self.response_format, max_retries=self.max_retries,
             tried_sites=list(self.tried_sites),
             attempts=[TaskAttemptInfo.model_validate(item) for item in task_db.list_attempts(self.task_id)],
         )
@@ -149,6 +159,8 @@ class TaskRecord:
             "usage_json": json.dumps(self.usage, ensure_ascii=False, sort_keys=True) if self.usage else None,
             "routing_mode": self.routing_mode,
             "routing_decision_json": json.dumps(self.routing_decision, ensure_ascii=False, sort_keys=True) if self.routing_decision else None,
+            "response_format_json": json.dumps(self.response_format, ensure_ascii=False, sort_keys=True) if self.response_format else None,
+            "max_retries": self.max_retries,
             "updated_at": self.updated_at,
         }
 
@@ -182,6 +194,8 @@ class TaskRecord:
             usage=(json.loads(value["usage_json"]) if value.get("usage_json") else None),
             routing_mode=value.get("routing_mode"),
             routing_decision=(json.loads(value["routing_decision_json"]) if value.get("routing_decision_json") else None),
+            response_format=(json.loads(value["response_format_json"]) if value.get("response_format_json") else None),
+            max_retries=value.get("max_retries"),
             updated_at=value.get("updated_at") or value["created_at"],
         )
 
@@ -201,11 +215,14 @@ class TaskStore:
                backend_type: Optional[BackendType] = None, model: Optional[str] = None,
                allow_fallback_sites: Optional[bool] = None, routing_mode: Optional[str] = None,
                routing_decision: Optional[dict[str, Any]] = None,
+               response_format: Optional[dict[str, Any]] = None,
+               max_retries: Optional[int] = None,
                idempotency_key: Optional[str] = None) -> TaskRecord:
         task, reused = self.create_or_get_idempotent(
             prompt, site, target_id=target_id, backend_type=backend_type, model=model,
             allow_fallback_sites=allow_fallback_sites, routing_mode=routing_mode,
-            routing_decision=routing_decision, idempotency_key=idempotency_key,
+            routing_decision=routing_decision, response_format=response_format,
+            max_retries=max_retries, idempotency_key=idempotency_key,
         )
         if reused:
             return task
@@ -216,6 +233,8 @@ class TaskStore:
         backend_type: Optional[BackendType] = None, model: Optional[str] = None,
         allow_fallback_sites: Optional[bool] = None, routing_mode: Optional[str] = None,
         routing_decision: Optional[dict[str, Any]] = None,
+        response_format: Optional[dict[str, Any]] = None,
+        max_retries: Optional[int] = None,
         idempotency_key: Optional[str] = None,
     ) -> tuple[TaskRecord, bool]:
         now = time.time()
@@ -223,14 +242,15 @@ class TaskStore:
             task_id=uuid.uuid4().hex, prompt=prompt, site=site, target_id=target_id,
             backend_type=backend_type, model=model,
             allow_fallback_sites=allow_fallback_sites, routing_mode=routing_mode,
-            routing_decision=routing_decision, idempotency_key=idempotency_key,
-            # adaptive 的幂等键绑定调用方逻辑请求，不绑定本次随机选择出的 target/model。
+            routing_decision=routing_decision, response_format=response_format,
+            max_retries=max_retries, idempotency_key=idempotency_key,
+            # adaptive 的幂等键绑定调用方逻辑请求，不绑定某个动态选择出的 target/model。
             request_hash=request_hash(
                 prompt, site,
                 None if routing_mode == "adaptive" else target_id,
                 None if routing_mode == "adaptive" else (backend_type.value if backend_type else None),
                 None if routing_mode == "adaptive" else model,
-                allow_fallback_sites, routing_mode),
+                allow_fallback_sites, routing_mode, response_format, max_retries),
             queue_deadline_at=now + self._max_queue_wait, updated_at=now,
         )
         try:
@@ -249,6 +269,10 @@ class TaskStore:
             if row:
                 task = TaskRecord.from_db_dict(row)
         return task
+
+    def get_by_idempotency_key(self, idempotency_key: str) -> Optional[TaskRecord]:
+        row = task_db.get_task_by_idempotency_key(idempotency_key)
+        return TaskRecord.from_db_dict(row) if row else None
 
     def discard(self, task_id: str) -> None:
         task_db.delete_task(task_id)
@@ -370,6 +394,17 @@ class TaskStore:
                   provider_status_code: Optional[int] = None,
                   usage: Optional[dict[str, Any]] = None) -> None:
         task = self._task(task_id)
+        task.phase = TaskPhase.validating_result
+        if task.current_attempt_id:
+            task_db.update_attempt(task.current_attempt_id, phase=task.phase.value)
+        self._persist(task, "result_validation_started", response_format=task.response_format is not None)
+        try:
+            result = validate_result(result, task.response_format)
+        except Exception as error:
+            code = getattr(error, "code", "response_validation_error")
+            self.update_attempt(task_id, error_code=code, error=str(error))
+            self._persist(task, "result_validation_failed", error_code=code, error=str(error))
+            raise
         task.status = TaskStatus.done
         task.phase = TaskPhase.completed
         task.result = result

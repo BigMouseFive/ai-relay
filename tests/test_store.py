@@ -1,6 +1,9 @@
 """TaskStore 单元测试。"""
 import time
 
+import pytest
+
+from app.response_contract import ResponseValidationError
 from app.schemas import TaskStatus
 from app.store import TaskStore
 
@@ -23,6 +26,35 @@ def test_任务生命周期_完成():
     info = store.get(task.task_id).to_info()
     assert info.result == "回答内容"
     assert info.elapsed_seconds is not None
+
+
+def test_json_contract_validates_and_normalizes_done_result():
+    store = TaskStore()
+    response_format = {
+        "type": "json_schema", "name": "test",
+        "schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}},
+    }
+    task = store.create("返回 JSON", None, response_format=response_format, max_retries=2)
+    store.mark_running(task.task_id)
+    store.mark_done(task.task_id, '{ "ok": true }')
+    assert task.status == TaskStatus.done
+    assert task.result == '{"ok":true}'
+    assert "系统输出契约" in task.execution_prompt()
+
+
+def test_json_contract_rejects_invalid_result_before_marking_done():
+    store = TaskStore()
+    response_format = {
+        "type": "json_schema", "name": "test",
+        "schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}},
+    }
+    task = store.create("返回 JSON", None, response_format=response_format, max_retries=1)
+    store.mark_running(task.task_id)
+    with pytest.raises(ResponseValidationError, match="不是合法 JSON") as caught:
+        store.mark_done(task.task_id, "```json {} ```")
+    assert caught.value.code == "response_invalid_json"
+    assert task.status == TaskStatus.running
+    assert task.phase.value == "validating_result"
 
 
 def test_任务生命周期_失败():

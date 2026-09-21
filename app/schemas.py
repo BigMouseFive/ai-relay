@@ -35,6 +35,7 @@ class TaskPhase(str, Enum):
     verifying_send = "verifying_send"
     generating = "generating"
     collecting_result = "collecting_result"
+    validating_result = "validating_result"
     cleaning_up = "cleaning_up"
     completed = "completed"
     failed = "failed"
@@ -63,6 +64,22 @@ class BackendType(str, Enum):
     openai_compatible = "openai_compatible"
 
 
+class RetryPolicy(BaseModel):
+    """调用方可将安全重试预算下发给 relay；实际值仍受服务端上限约束。"""
+
+    max_retries: int = Field(ge=0, le=20)
+
+
+class JsonSchemaResponseFormat(BaseModel):
+    """要求 relay 返回通过 Draft 2020-12 JSON Schema 校验的规范 JSON 文本。"""
+
+    type: Literal["json_schema"]
+    name: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    schema_: dict[str, Any] = Field(alias="schema")
+
+    model_config = {"populate_by_name": True}
+
+
 class SubmitTaskRequest(BaseModel):
     prompt: str = Field(min_length=1)
     # site 是旧浏览器路由兼容参数；新调用方使用 target 精确指定执行后端。
@@ -72,6 +89,8 @@ class SubmitTaskRequest(BaseModel):
     routing_mode: Optional[Literal["browser", "adaptive"]] = None
     model: Optional[str] = None
     allow_fallback_sites: Optional[bool] = None
+    retry_policy: Optional[RetryPolicy] = None
+    response_format: Optional[JsonSchemaResponseFormat] = None
 
     @field_validator("prompt")
     @classmethod
@@ -86,6 +105,9 @@ class SubmitTaskRequest(BaseModel):
         if value is not None and not value.strip():
             raise ValueError("target 不能为空白")
         return value.strip() if value else value
+
+    def response_format_payload(self) -> Optional[dict[str, Any]]:
+        return self.response_format.model_dump(by_alias=True) if self.response_format else None
 
 
 class SubmitTaskResponse(BaseModel):
@@ -154,6 +176,8 @@ class TaskInfo(BaseModel):
     usage: Optional[dict[str, Any]] = None
     routing_mode: Optional[str] = None
     routing_decision: Optional[dict[str, Any]] = None
+    response_format: Optional[dict[str, Any]] = None
+    max_retries: Optional[int] = None
     tried_sites: list[str] = Field(default_factory=list)
     attempts: list[TaskAttemptInfo] = Field(default_factory=list)
 

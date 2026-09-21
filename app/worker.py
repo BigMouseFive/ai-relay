@@ -11,6 +11,7 @@ import time
 from contextlib import suppress
 from typing import Callable, Optional
 
+from .response_contract import ResponseValidationError, validate_result
 from .schemas import BackendType, TaskPhase, TaskStatus, WorkerState
 from .sites.base import SendOutcomeUnknownError, SiteAdapter
 from .store import TaskRecord, TaskStore
@@ -41,11 +42,13 @@ class Worker:
                  store: TaskStore, timeout_seconds: float = 600,
                  stall_seconds: float = 120, hard_timeout_seconds: float = 300,
                  on_retry: Optional[Callable[[TaskRecord, str, str], bool]] = None,
-                 target_id: Optional[str] = None):
+                 target_id: Optional[str] = None,
+                 tab_group_title: str = "A"):
         self.worker_id = worker_id
         self.site = site
         self.target_id = target_id or f"legacy-webbridge-{site}"
         self.backend_type = BackendType.webbridge
+        self.tab_group_title = tab_group_title
         self.model = model
         self.adapter = adapter
         self.store = store
@@ -98,7 +101,8 @@ class Worker:
             async with asyncio.timeout(TAB_CLEANUP_TIMEOUT):
                 await self.adapter.client.close_session(self.adapter.session)
         await self.adapter.client.navigate(
-            self.adapter.home_url, self.adapter.session, new_tab=True, group_title="ai-relay")
+            self.adapter.home_url, self.adapter.session, new_tab=True,
+            group_title=self.tab_group_title)
         await asyncio.sleep(PAGE_LOAD_WAIT)
 
     async def _rebuild_tab(self, reason: str) -> bool:
@@ -198,6 +202,12 @@ class Worker:
             with suppress(Exception):
                 self.store.mark_cancelled(task.task_id, str(e))
             logger.info("任务 %s 已取消", task.task_id[:8])
+        except ResponseValidationError as e:
+            # 已取得确定回答但不满足调用方 JSON 契约；允许由 pool 按预算重试。
+            error = self._error_text(e)
+            if self.on_retry is None or not self.on_retry(task, error, e.code):
+                self.fail_count += 1
+                logger.warning("任务 %s 输出契约校验最终失败 [%s]: %s", task.task_id[:8], e.code, error)
         except Exception as e:
             error = self._error_text(e)
             code = self._error_code(e)
@@ -215,6 +225,12 @@ class Worker:
         else:
             try:
                 self.store.mark_done(task.task_id, answer)
+            except ResponseValidationError as error:
+                # 返回已确定，因此格式/Schema 不合格可以作为一条新 attempt 安全重试。
+                if self.on_retry is None or not self.on_retry(task, self._error_text(error), error.code):
+                    self.fail_count += 1
+                    logger.warning("任务 %s 输出契约校验最终失败 [%s]: %s",
+                                   task.task_id[:8], error.code, error)
             except Exception as e:
                 # 真实结果已拿到但无法可靠落库时，不能向 API 误报 done。
                 # 即使数据库持续故障，mark_outcome_unknown 也会先修正内存状态。
@@ -246,7 +262,7 @@ class Worker:
 
         self.store.set_phase(task.task_id, TaskPhase.sending)
         self.store.update_attempt(task.task_id, phase=TaskPhase.sending, send_state="sending")
-        await self.adapter.send_prompt(task.prompt)
+        await self.adapter.send_prompt(task.execution_prompt())
         # send_prompt 只有在已确认当前用户消息或生成态后才返回。
         self.store.set_phase(task.task_id, TaskPhase.verifying_send)
         self.store.update_attempt(task.task_id, phase=TaskPhase.verifying_send,
@@ -257,6 +273,8 @@ class Worker:
         hard_deadline = started + self.hard_timeout_seconds
         stall_deadline = started + self.stall_seconds
         previous_answer: Optional[str] = None
+        stable_contract_answer: Optional[str] = None
+        stable_contract_polls = 0
         last_progress_answer = baseline
         try:
             while True:
@@ -281,6 +299,27 @@ class Worker:
 
                 if snap.get("generating"):
                     previous_answer = None
+                    # 某些网页（实测 MiniMax）在回答完成后仍长期保留 stop-button。
+                    # 仅对声明了 JSON Schema 的任务，连续三次读到完全相同且已通过
+                    # 契约的完整结果时安全结束；不接受普通文本或不完整 JSON。
+                    if answer and answer != baseline and task.response_format is not None:
+                        try:
+                            validate_result(answer, task.response_format)
+                        except ResponseValidationError:
+                            stable_contract_answer = None
+                            stable_contract_polls = 0
+                        else:
+                            if answer == stable_contract_answer:
+                                stable_contract_polls += 1
+                            else:
+                                stable_contract_answer = answer
+                                stable_contract_polls = 1
+                            if stable_contract_polls >= 3:
+                                self.store.set_phase(task.task_id, TaskPhase.collecting_result)
+                                return answer
+                    else:
+                        stable_contract_answer = None
+                        stable_contract_polls = 0
                     continue
                 if not answer or answer == baseline:
                     previous_answer = None

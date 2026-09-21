@@ -25,6 +25,8 @@ class WebbridgeConfig(StrictConfigModel):
     base_url: str = "http://127.0.0.1:10086"
     command_timeout_seconds: float = Field(default=60.0, gt=0)
     status_timeout_seconds: float = Field(default=5.0, gt=0)
+    # 每个独立 session 仍有自己的 Chrome Tab Group；使用短标签降低横向占用。
+    tab_group_title: str = Field(default="A", min_length=1, max_length=40)
 
 
 class WorkerConfig(StrictConfigModel):
@@ -83,6 +85,8 @@ class OpenAICompatibleTargetConfig(TargetBaseConfig):
     allow_model_override: bool = False
     allowed_models: list[str] = Field(default_factory=list)
     max_output_tokens: Optional[int] = Field(default=None, ge=1)
+    # 启动时只读 GET /models 校验配置模型仍被上游公布，不消耗模型 token。
+    verify_model_on_start: bool = False
     # 仅在上游明确保证 Idempotency-Key 语义时启用；默认避免 5xx 后重复执行。
     retry_server_errors: bool = False
 
@@ -105,8 +109,11 @@ class TaskConfig(StrictConfigModel):
     timeout_seconds: int = Field(default=600, gt=0)
     retention_seconds: int = Field(default=3600, gt=0)
     max_prompt_chars: int = Field(default=12000, gt=0)
+    max_response_schema_chars: int = Field(default=30000, ge=100, le=1_000_000)
     stall_seconds: int = Field(default=120, gt=0)
     max_retries: int = Field(default=3, ge=0)
+    # /v1 调用方传递 retry_policy 时的服务端硬上限。
+    max_client_requested_retries: int = Field(default=3, ge=0, le=20)
     hard_timeout_seconds: int = Field(default=300, gt=0)
     # 跨浏览器站点发送同一 prompt 会改变隐私、成本和模型语义，因此默认关闭。
     retry_switch_site: bool = False
@@ -129,6 +136,24 @@ class QueueConfig(StrictConfigModel):
     max_size: int = Field(default=100, gt=0)
 
 
+class TaskRoutingPolicy(StrictConfigModel):
+    """按 response_format.name 限制自动路由候选与并发。"""
+
+    allowed_targets: list[str] = Field(min_length=1)
+    max_in_flight_per_target: Optional[int] = Field(default=None, ge=1, le=64)
+
+    @model_validator(mode="after")
+    def validate_allowed_targets(self) -> "TaskRoutingPolicy":
+        target_id_pattern = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$"
+        invalid = [target_id for target_id in self.allowed_targets
+                   if not re.fullmatch(target_id_pattern, target_id)]
+        if invalid:
+            raise ValueError(f"allowed_targets 包含非法 target id: {', '.join(invalid)}")
+        if len(set(self.allowed_targets)) != len(self.allowed_targets):
+            raise ValueError("allowed_targets 中 target id 必须唯一")
+        return self
+
+
 class RoutingConfig(StrictConfigModel):
     """基于近期 attempt 数据的自动 target 选择策略。"""
 
@@ -139,6 +164,15 @@ class RoutingConfig(StrictConfigModel):
     latency_reference_seconds: float = Field(default=60.0, gt=0)
     failure_penalty: float = Field(default=0.50, ge=0, le=1)
     outcome_unknown_penalty: float = Field(default=0.85, ge=0, le=1)
+    task_policies: dict[str, TaskRoutingPolicy] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_task_policy_names(self) -> "RoutingConfig":
+        name_pattern = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$"
+        invalid = [name for name in self.task_policies if not re.fullmatch(name_pattern, name)]
+        if invalid:
+            raise ValueError(f"task_policies 包含非法 response_format.name: {', '.join(invalid)}")
+        return self
 
 
 class DashboardConfig(StrictConfigModel):
@@ -157,14 +191,14 @@ class StorageConfig(StrictConfigModel):
         return self
 
 
-class ErpConfig(StrictConfigModel):
-    """向 ERP 心跳注册（register_url 为空则不注册）。"""
+class DiscoveryConfig(StrictConfigModel):
+    """局域网 IPv4 mDNS/DNS-SD 服务公告；不配置 ERP 地址。"""
 
-    register_url: str = ""
-    node_name: str = ""
-    advertise_url: str = ""
-    token: str = ""
-    interval_seconds: int = Field(default=30, gt=0)
+    enabled: bool = True
+    instance_name: str = ""
+    # 多网卡主机可指定一个可被 ERP 访问的 IPv4；留空则自动探测私有 IPv4。
+    advertise_address: str = ""
+    identity_path: str = "data/service-identity.json"
 
 
 class Config(StrictConfigModel):
@@ -180,7 +214,7 @@ class Config(StrictConfigModel):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
-    erp: ErpConfig = Field(default_factory=ErpConfig)
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
 
     @model_validator(mode="after")
     def normalize_targets(self) -> "Config":
@@ -199,6 +233,13 @@ class Config(StrictConfigModel):
                 model=worker.model, count=worker.count,
             ))
             explicit_ids.add(target_id)
+
+        for policy_name, policy in self.routing.task_policies.items():
+            unknown = sorted(set(policy.allowed_targets) - explicit_ids)
+            if unknown:
+                raise ValueError(
+                    f"routing.task_policies.{policy_name}.allowed_targets 包含未知 target id: "
+                    f"{', '.join(unknown)}")
 
         self.targets = targets
         return self

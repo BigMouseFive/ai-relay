@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -20,6 +21,7 @@ from . import db as task_db
 from .config import Config, load_config
 from .instance_lock import InstanceLock
 from .pool import QueueFull, WorkerPool
+from .response_contract import validate_response_format
 from .schemas import (
     StatsResponse, SubmitTaskRequest, SubmitTaskResponse, TaskEventInfo, TaskInfo,
     TaskListPage, TaskStatus, HealthResponse,
@@ -60,7 +62,8 @@ def create_app(config_path: Optional[str] = None, *, config: Optional[Config] = 
         db_open = False
         st: Optional[TaskStore] = None
         pl: Optional[WorkerPool] = None
-        registrar = None
+        publisher = None
+        service_id = None
         try:
             if instance_lock:
                 instance_lock.acquire()
@@ -94,15 +97,30 @@ def create_app(config_path: Optional[str] = None, *, config: Optional[Config] = 
             app.state.db_path = db_path
             st.start()
             await pl.start()
-            if cfg.erp.register_url:
-                from .registrar import ErpRegistrar
-                registrar = ErpRegistrar(cfg.erp, cfg.server.port)
-                await registrar.start()
+            # 注入 store/pool 的测试/嵌入模式由宿主自行管理服务发现，避免测试发布真实 mDNS。
+            if cfg.discovery.enabled and manage_db:
+                from .discovery import (
+                    MdnsPublisher, load_or_create_service_id, start_publisher_async,
+                    stop_publisher_async,
+                )
+                identity_path = Path(cfg.discovery.identity_path).expanduser()
+                if not identity_path.is_absolute():
+                    identity_path = Path(config_file).resolve().parent / identity_path
+                service_id = load_or_create_service_id(identity_path)
+                publisher = MdnsPublisher(
+                    service_id=service_id, port=cfg.server.port,
+                    instance_name=cfg.discovery.instance_name,
+                    advertise_address=cfg.discovery.advertise_address,
+                )
+                # zeroconf 的同步注册会阻塞事件循环，必须在线程中执行。
+                await start_publisher_async(publisher)
+            app.state.service_id = service_id
+            app.state.mdns_publisher = publisher
             logger.info("ai-relay 已启动，监听 %s:%d", cfg.server.host, cfg.server.port)
             yield
         finally:
-            if registrar:
-                await registrar.stop()
+            if publisher:
+                await stop_publisher_async(publisher)
             if pl:
                 await pl.stop()
             if st:
@@ -119,8 +137,8 @@ def create_app(config_path: Optional[str] = None, *, config: Optional[Config] = 
         """兼容接口；新调用方应使用 /v1/tasks + Idempotency-Key。"""
         if len(req.prompt) > request.app.state.config.task.max_prompt_chars:
             raise HTTPException(422, "prompt 超长")
-        if req.target:
-            raise HTTPException(422, "旧 /api/tasks 不支持 target，请使用 /v1/tasks")
+        if req.target or req.retry_policy or req.response_format:
+            raise HTTPException(422, "旧 /api/tasks 不支持 target、retry_policy 或 response_format，请使用 /v1/tasks")
         try:
             task_id = await request.app.state.pool.submit(
                 req.prompt, req.site.value if req.site else None)
@@ -143,6 +161,14 @@ def create_app(config_path: Optional[str] = None, *, config: Optional[Config] = 
         cfg_local = request.app.state.config
         if len(req.prompt) > cfg_local.task.max_prompt_chars:
             raise HTTPException(422, "prompt 超长")
+        response_format = req.response_format_payload()
+        if response_format:
+            try:
+                validate_response_format(response_format)
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from error
+            if len(json.dumps(response_format["schema"], ensure_ascii=False)) > cfg_local.task.max_response_schema_chars:
+                raise HTTPException(422, "response_format.schema 超过大小上限")
         if not idempotency_key:
             raise HTTPException(422, "缺少 Idempotency-Key")
         if len(idempotency_key) > 255:
@@ -153,6 +179,8 @@ def create_app(config_path: Optional[str] = None, *, config: Optional[Config] = 
                 req.prompt, req.site.value if req.site else None, target_id=req.target,
                 routing_mode=req.routing_mode, model=req.model,
                 allow_fallback_sites=req.allow_fallback_sites,
+                response_format=response_format,
+                retry_policy_max_retries=(req.retry_policy.max_retries if req.retry_policy else None),
                 idempotency_key=idempotency_key,
             )
         except task_db.IdempotencyConflict as e:
@@ -189,6 +217,18 @@ def create_app(config_path: Optional[str] = None, *, config: Optional[Config] = 
             created_before=created_before)
         items = [TaskRecord.from_db_dict(row).to_summary() for row in rows]
         return TaskListPage(items=items, total=total, page=page, page_size=page_size)
+
+    @app.get("/v1/tasks/by-idempotency-key", response_model=TaskInfo)
+    async def get_task_by_idempotency_key(
+        request: Request,
+        idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    ):
+        if idempotency_key is None or not idempotency_key.strip():
+            raise HTTPException(422, "缺少 Idempotency-Key")
+        task = request.app.state.store.get_by_idempotency_key(idempotency_key)
+        if task is None:
+            raise HTTPException(404, "任务不存在")
+        return task.to_info()
 
     @app.get("/api/tasks/{task_id}", response_model=TaskInfo)
     @app.get("/v1/tasks/{task_id}", response_model=TaskInfo)
@@ -298,6 +338,39 @@ def create_app(config_path: Optional[str] = None, *, config: Optional[Config] = 
             queued_tasks=queued, workers=pl.workers_info(),
             recent_tasks=[task.to_summary() for task in request.app.state.store.history()],
         )
+
+    @app.get("/.well-known/amazon-service")
+    async def service_metadata(request: Request):
+        """供 LAN discovery agent 校验 mDNS 公告与服务协议。"""
+        return {
+            "service_type": "ai-relay",
+            "service_id": getattr(request.app.state, "service_id", None),
+            "api_version": 1,
+            "endpoints": {
+                "tasks": "/v1/tasks",
+                "task": "/v1/tasks/{task_id}",
+                "task_by_idempotency_key": "/v1/tasks/by-idempotency-key",
+                "readiness": "/v1/readiness",
+                "capabilities": "/v1/capabilities",
+            },
+        }
+
+    @app.get("/v1/readiness")
+    async def readiness(request: Request):
+        """接单就绪状态；不同于仅表示进程存活的 /health。"""
+        workers = request.app.state.pool.workers_info()
+        healthy_workers = sum(worker.state.value != "degraded" for worker in workers)
+        degraded_workers = sum(worker.state.value == "degraded" for worker in workers)
+        queue_size = len(request.app.state.pool.queue_snapshot())
+        queue_max_size = request.app.state.config.queue.max_size
+        return {
+            "ready": healthy_workers > 0,
+            "accepting_tasks": healthy_workers > 0 and queue_size < queue_max_size,
+            "queue_size": queue_size,
+            "queue_max_size": queue_max_size,
+            "healthy_workers": healthy_workers,
+            "degraded_workers": degraded_workers,
+        }
 
     @app.get("/health", response_model=HealthResponse)
     async def health(request: Request):

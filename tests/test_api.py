@@ -34,12 +34,14 @@ class FakePool:
         return task.task_id
 
     async def submit_with_metadata(self, prompt, site, *, target_id=None, routing_mode=None,
-                                   model=None, allow_fallback_sites=None, idempotency_key=None):
+                                   model=None, allow_fallback_sites=None, response_format=None,
+                                   retry_policy_max_retries=None, idempotency_key=None):
         if self.full:
             raise QueueFull("队列已满")
         task, reused = self.store.create_or_get_idempotent(
             prompt, site, target_id=target_id, model=model,
             allow_fallback_sites=allow_fallback_sites, routing_mode=routing_mode,
+            response_format=response_format, max_retries=retry_policy_max_retries,
             idempotency_key=idempotency_key)
         self.submitted.append((prompt, site))
         self.submitted_targets.append(target_id)
@@ -198,6 +200,18 @@ def test_health(client):
     assert body == {"ok": True, "daemon_ok": True, "daemon_detail": "ok"}
 
 
+def test_service_metadata_and_readiness(client):
+    metadata = client.get("/.well-known/amazon-service")
+    assert metadata.status_code == 200
+    assert metadata.json()["service_type"] == "ai-relay"
+    assert metadata.json()["api_version"] == 1
+    assert metadata.json()["endpoints"]["task_by_idempotency_key"] == "/v1/tasks/by-idempotency-key"
+    readiness = client.get("/v1/readiness")
+    assert readiness.status_code == 200
+    assert readiness.json()["ready"] is False
+    assert readiness.json()["accepting_tasks"] is False
+
+
 def test_v1_submit_requires_idempotency_key(client):
     r = client.post("/v1/tasks", json={"prompt": "你好"})
     assert r.status_code == 422
@@ -218,6 +232,35 @@ def test_v1_submit_is_idempotent_and_emits_events(client):
     assert events.json()[0]["event_type"] == "task_created"
 
 
+def test_v1_get_task_by_idempotency_key_returns_the_normal_task_info(client, pool, store):
+    headers = {"Idempotency-Key": "lookup-key"}
+    submitted = client.post("/v1/tasks", json={"prompt": "lookup", "site": "kimi"}, headers=headers)
+    task_id = submitted.json()["task_id"]
+    normal = client.get(f"/v1/tasks/{task_id}")
+    events_before = client.get(f"/v1/tasks/{task_id}/events").json()
+    submissions_before = list(pool.submitted)
+
+    lookup = client.get("/v1/tasks/by-idempotency-key", headers=headers)
+
+    assert lookup.status_code == 200
+    assert lookup.json() == normal.json()
+    assert pool.submitted == submissions_before
+    assert store.get(task_id).status == TaskStatus.queued
+    assert client.get(f"/v1/tasks/{task_id}/events").json() == events_before
+
+
+@pytest.mark.parametrize("headers", [{}, {"Idempotency-Key": "   "}])
+def test_v1_get_task_by_idempotency_key_requires_a_nonblank_header(client, headers):
+    response = client.get("/v1/tasks/by-idempotency-key", headers=headers)
+    assert response.status_code == 422
+
+
+def test_v1_get_task_by_idempotency_key_returns_404_when_absent(client):
+    response = client.get(
+        "/v1/tasks/by-idempotency-key", headers={"Idempotency-Key": "missing-key"})
+    assert response.status_code == 404
+
+
 def test_v1_target_is_forwarded_to_pool(client, pool):
     r = client.post("/v1/tasks", json={"prompt": "target", "target": "api-one"},
                     headers={"Idempotency-Key": "target-key"})
@@ -225,9 +268,13 @@ def test_v1_target_is_forwarded_to_pool(client, pool):
     assert pool.submitted_targets == ["api-one"]
 
 
-def test_old_api_rejects_target(client):
-    r = client.post("/api/tasks", json={"prompt": "target", "target": "api-one"})
-    assert r.status_code == 422
+def test_old_api_rejects_v1_only_options(client):
+    for payload in (
+        {"prompt": "target", "target": "api-one"},
+        {"prompt": "retry", "retry_policy": {"max_retries": 1}},
+        {"prompt": "json", "response_format": {"type": "json_schema", "name": "test", "schema": {"type": "object"}}},
+    ):
+        assert client.post("/api/tasks", json=payload).status_code == 422
 
 
 def test_v1_same_key_different_request_conflicts(client):
@@ -235,6 +282,33 @@ def test_v1_same_key_different_request_conflicts(client):
     assert client.post("/v1/tasks", json={"prompt": "一"}, headers=headers).status_code == 202
     r = client.post("/v1/tasks", json={"prompt": "二"}, headers=headers)
     assert r.status_code == 409
+
+
+def test_v1_json_schema_contract_and_retry_budget_are_forwarded(client, pool):
+    payload = {
+        "prompt": "返回 JSON",
+        "routing_mode": "adaptive",
+        "retry_policy": {"max_retries": 2},
+        "response_format": {
+            "type": "json_schema", "name": "test-contract",
+            "schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}},
+        },
+    }
+    response = client.post("/v1/tasks", json=payload, headers={"Idempotency-Key": "json-contract-key"})
+    assert response.status_code == 202
+    task = pool.store.get(response.json()["task_id"])
+    assert task.max_retries == 2
+    assert task.response_format == payload["response_format"]
+
+
+def test_v1_rejects_invalid_json_schema(client):
+    payload = {
+        "prompt": "x",
+        "response_format": {"type": "json_schema", "name": "bad", "schema": {"type": "not-a-real-type"}},
+    }
+    response = client.post("/v1/tasks", json=payload, headers={"Idempotency-Key": "invalid-schema-key"})
+    assert response.status_code == 422
+    assert "schema" in response.json()["detail"]
 
 
 def test_v1_cancel_queued_task(client):

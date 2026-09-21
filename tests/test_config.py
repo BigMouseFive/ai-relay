@@ -1,6 +1,8 @@
 """配置严格校验与单实例锁测试。"""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app.config import Config, load_config
@@ -9,6 +11,20 @@ from app.instance_lock import InstanceAlreadyRunning, InstanceLock
 
 def _valid() -> dict:
     return {"workers": [{"site": "kimi", "model": ""}]}
+
+
+def test_default_example_is_acp_only_and_never_requires_webbridge():
+    path = Path(__file__).resolve().parents[1] / "config.example.yaml"
+    config = load_config(path)
+
+    assert [(target.id, target.type, target.count) for target in config.targets] == [
+        ("cursor-agent-ai-relay", "acp", 2)
+    ]
+    assert config.workers == []
+    assert config.routing.task_policies["listing_copy"].allowed_targets == [
+        "cursor-agent-ai-relay"
+    ]
+    assert all(target.type != "webbridge" for target in config.targets)
 
 
 def test_config_rejects_unknown_field():
@@ -53,6 +69,28 @@ def test_duplicate_target_ids_are_rejected():
         ]})
 
 
+def test_task_policy_target_ids_are_validated_after_target_normalization():
+    config = Config.model_validate({
+        "workers": [{"site": "kimi", "model": ""}],
+        "routing": {"task_policies": {
+            "listing_copy": {
+                "allowed_targets": ["legacy-webbridge-kimi-1"],
+                "max_in_flight_per_target": 1,
+            },
+        }},
+    })
+    assert config.routing.task_policies["listing_copy"].allowed_targets == [
+        "legacy-webbridge-kimi-1"]
+
+    with pytest.raises(Exception, match="未知 target id.*missing-target"):
+        Config.model_validate({
+            "workers": [{"site": "kimi", "model": ""}],
+            "routing": {"task_policies": {
+                "listing_copy": {"allowed_targets": ["missing-target"]},
+            }},
+        })
+
+
 def test_environment_file_loads_missing_values_without_overriding_process_env(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
     path.write_text("environment_file: .env\nworkers:\n  - site: kimi\n    model: ''\n", encoding="utf-8")
@@ -63,6 +101,14 @@ def test_environment_file_loads_missing_values_without_overriding_process_env(tm
     monkeypatch.setenv("TEST_RELAY_KEY", "from-process")
     load_config(path)
     assert __import__("os").environ["TEST_RELAY_KEY"] == "from-process"
+
+
+def test_discovery_config_defaults_and_rejects_unknown_field():
+    config = Config.model_validate(_valid())
+    assert config.discovery.enabled is True
+    assert config.discovery.identity_path == "data/service-identity.json"
+    with pytest.raises(Exception, match="unknown"):
+        Config.model_validate({**_valid(), "discovery": {"unknown": True}})
 
 
 def test_instance_lock_excludes_second_owner(tmp_path):

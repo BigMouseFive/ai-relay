@@ -8,8 +8,8 @@
 # 说明：
 # - macOS 使用 launchd LaunchAgent（用户登录后自启，KeepAlive 崩溃自动拉起）
 # - Ubuntu 使用 systemd 用户服务 + loginctl linger（开机自启，无需登录）
-# - kimi-webbridge 是本服务的硬依赖（驱动真实浏览器），脚本会自动安装并启动
-# - 浏览器扩展与站点登录无法自动化，脚本会给出指引
+# - 默认 ACP-only，不安装/启动 kimi-webbridge，也不会打开浏览器
+# - 仅当 config.yaml 明确配置 WebBridge target 时，才检查并启动浏览器桥
 set -euo pipefail
 # 配置、SQLite 和日志可能含有 prompt/result 或 ERP token。
 umask 077
@@ -40,12 +40,16 @@ ensure_config() {
   fi
   cp "$PROJECT_DIR/config.example.yaml" "$CONFIG"
   chmod 600 "$CONFIG"
-  warn "已从 config.example.yaml 创建 $CONFIG，请按实际浏览器登录和 ERP 环境检查后重新运行安装。"
+  warn "已从 ACP-only 模板创建 $CONFIG，请检查 agent 命令、工作目录和 LAN 地址后重新运行安装。"
   exit 1
 }
 
 config_port() {
   "$VENV/bin/python" -c 'from app.config import load_config; import sys; print(load_config(sys.argv[1]).server.port)' "$CONFIG" 2>/dev/null || echo 8600
+}
+
+config_requires_webbridge() {
+  "$VENV/bin/python" -c 'from app.config import load_config; import sys; c=load_config(sys.argv[1]); raise SystemExit(0 if any(t.type == "webbridge" for t in c.targets) else 1)' "$CONFIG"
 }
 
 uninstall() {
@@ -60,7 +64,7 @@ uninstall() {
     systemctl --user daemon-reload 2>/dev/null || true
     log "已移除 systemd 用户服务: ai-relay"
   fi
-  log "完成。webbridge daemon 仍在运行，如需停止: $WEBBRIDGE_BIN stop"
+  log "完成。若曾单独安装 webbridge，其 daemon 保持原状态。"
   exit 0
 }
 
@@ -87,26 +91,7 @@ if [[ "$PLATFORM" == "linux" ]] && ! python3 -m venv --help >/dev/null 2>&1; the
 fi
 log "Python $(python3 --version | awk '{print $2}') OK"
 
-# ============ 2. kimi-webbridge daemon ============
-log "检查 kimi-webbridge ..."
-if [[ ! -x "$WEBBRIDGE_BIN" ]]; then
-  log "安装 kimi-webbridge ..."
-  curl -fsSL https://cdn.kimi.com/webbridge/install.sh | bash
-fi
-"$WEBBRIDGE_BIN" start >/dev/null 2>&1 || true
-WB_STATUS="$("$WEBBRIDGE_BIN" status 2>/dev/null || true)"
-if echo "$WB_STATUS" | grep -q '"extension_connected":true'; then
-  log "webbridge daemon 已连接浏览器扩展"
-else
-  warn "webbridge 浏览器扩展未连接。请："
-  warn "  1. 打开浏览器安装 Kimi WebBridge 扩展: https://www.kimi.com/zh-cn/features/webbridge"
-  warn "  2. 在浏览器中登录要用的站点（kimi.com / chat.deepseek.com / agent.minimaxi.com）"
-  if [[ "$PLATFORM" == "linux" ]]; then
-    warn "  （Ubuntu 需要桌面环境与 Chrome/Chromium 浏览器；纯无头服务器无法使用 webbridge）"
-  fi
-fi
-
-# ============ 3. 虚拟环境 + 依赖 ============
+# ============ 2. 虚拟环境 + 依赖 ============
 log "准备 Python 虚拟环境 ..."
 [[ -d "$VENV" ]] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
@@ -119,6 +104,29 @@ if ! "$VENV/bin/python" -c 'from app.config import load_config; import sys; load
   exit 1
 fi
 PORT="$(config_port)"; PORT="${PORT:-8600}"
+
+# ============ 3. 可选 WebBridge ============
+if config_requires_webbridge; then
+  log "配置包含 WebBridge target，检查 kimi-webbridge ..."
+  if [[ ! -x "$WEBBRIDGE_BIN" ]]; then
+    log "安装 kimi-webbridge ..."
+    curl -fsSL https://cdn.kimi.com/webbridge/install.sh | bash
+  fi
+  "$WEBBRIDGE_BIN" start >/dev/null 2>&1 || true
+  WB_STATUS="$("$WEBBRIDGE_BIN" status 2>/dev/null || true)"
+  if echo "$WB_STATUS" | grep -q '"extension_connected":true'; then
+    log "webbridge daemon 已连接浏览器扩展"
+  else
+    warn "webbridge 浏览器扩展未连接。请："
+    warn "  1. 打开浏览器安装 Kimi WebBridge 扩展: https://www.kimi.com/zh-cn/features/webbridge"
+    warn "  2. 在浏览器中登录要用的站点（kimi.com / chat.deepseek.com / agent.minimaxi.com）"
+    if [[ "$PLATFORM" == "linux" ]]; then
+      warn "  （Ubuntu 需要桌面环境与 Chrome/Chromium 浏览器；纯无头服务器无法使用 webbridge）"
+    fi
+  fi
+else
+  log "ACP/API-only 配置：跳过 kimi-webbridge，不打开浏览器"
+fi
 
 mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/data"
 chmod 700 "$PROJECT_DIR/logs" "$PROJECT_DIR/data"

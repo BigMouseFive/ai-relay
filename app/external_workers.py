@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from .config import AcpTargetConfig, OpenAICompatibleTargetConfig
+from .response_contract import ResponseValidationError
 from .schemas import BackendType, TaskPhase, TaskStatus, WorkerState
 from .store import TaskRecord, TaskStore
 
@@ -180,6 +181,12 @@ class ExternalWorker:
                     provider_status_code=result.provider_status_code,
                     usage=result.usage,
                 )
+            except ResponseValidationError as error:
+                # 外部 target 已返回确定文本；Schema 不合格可安全安排新的 attempt。
+                if not self.on_retry(task, self._error_text(error), error.code):
+                    self.fail_count += 1
+                    logger.warning("任务 %s 外部输出契约校验最终失败 [%s]: %s",
+                                   task.task_id[:8], error.code, error)
             except Exception as error:
                 with suppress(Exception):
                     self.store.mark_outcome_unknown(
@@ -296,7 +303,7 @@ class AcpWorker(ExternalWorker):
         self.store.set_phase(task.task_id, TaskPhase.sending)
         self.store.update_attempt(task.task_id, phase=TaskPhase.sending, send_state="sending")
 
-        argv = self._build_argv(task.prompt)
+        argv = self._build_argv(task.execution_prompt())
         stdin: Optional[int] = None
         input_data: Optional[bytes] = None
 
@@ -445,6 +452,36 @@ class OpenAICompatibleWorker(ExternalWorker):
             timeout=self.timeout_seconds,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         )
+        if self.target.verify_model_on_start:
+            await self._verify_model_available()
+
+    async def _verify_model_available(self) -> None:
+        """只读校验配置模型仍被上游公开；失败则 target 启动为 degraded。"""
+        if not self._client:
+            raise ExternalWorkerError("OpenAI-compatible client 未初始化")
+        try:
+            response = await self._client.get("models")
+        except httpx.HTTPError as error:
+            raise ExternalWorkerError(f"API 模型列表检查失败: {error}") from error
+        if response.status_code >= 400:
+            raise ExternalWorkerError(
+                f"API 模型列表检查失败: HTTP {response.status_code}"
+            )
+        try:
+            payload = response.json()
+            rows = payload.get("data", [])
+            model_ids = {
+                str(row.get("id"))
+                for row in rows
+                if isinstance(row, dict) and row.get("id")
+            }
+        except (TypeError, ValueError) as error:
+            raise ExternalWorkerError(f"API 模型列表响应无效: {error}") from error
+        if self.target.model not in model_ids:
+            raise ExternalWorkerError(
+                f"API 配置模型不存在: {self.target.model}；上游当前模型: "
+                f"{', '.join(sorted(model_ids)) or '(empty)'}"
+            )
 
     async def stop(self) -> None:
         if self._client:
@@ -471,7 +508,7 @@ class OpenAICompatibleWorker(ExternalWorker):
         self.store.update_attempt(task.task_id, phase=TaskPhase.sending, send_state="sending")
         body: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": task.prompt}],
+            "messages": [{"role": "user", "content": task.execution_prompt()}],
             "stream": False,
         }
         if self.target.max_output_tokens:
@@ -490,6 +527,14 @@ class OpenAICompatibleWorker(ExternalWorker):
             raise ExternalOutcomeUnknownError(f"API 请求状态不确定: {error}") from error
 
         request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
+        # 已收到明确 HTTP 响应，外部请求的发送结果已确认；后续即使内容不合格，
+        # 也属于可由 relay 按预算安全重试的确定失败，不应留在 sending。
+        self.store.update_attempt(
+            task.task_id,
+            phase=TaskPhase.collecting_result,
+            send_state="sent_confirmed",
+            provider_status_code=response.status_code,
+        )
         if response.status_code in {408, 409, 425, 429}:
             raise ApiResponseError(
                 self._response_error(response), code="api_retryable_status",
@@ -508,14 +553,31 @@ class OpenAICompatibleWorker(ExternalWorker):
                                    status_code=response.status_code)
         try:
             data = response.json()
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            message = choice["message"]
+            content = message.get("content")
+            if content is None:
+                finish_reason = choice.get("finish_reason")
+                message_keys = sorted(message) if isinstance(message, dict) else []
+                raise ValueError(
+                    f"message.content 缺失（finish_reason={finish_reason!r}, "
+                    f"message_keys={message_keys}）"
+                )
             text = self._content_to_text(content)
         except (KeyError, IndexError, TypeError, ValueError) as error:
-            raise ApiResponseError(f"API 响应格式无效: {error}", code="api_invalid_response",
-                                   status_code=response.status_code) from error
+            raise ApiResponseError(
+                f"API 响应格式无效: {error}",
+                code="api_invalid_response",
+                status_code=response.status_code,
+                retryable=True,
+            ) from error
         if not text.strip():
-            raise ApiResponseError("API 返回空回答", code="api_empty_response",
-                                   status_code=response.status_code)
+            raise ApiResponseError(
+                "API 返回空回答",
+                code="api_empty_response",
+                status_code=response.status_code,
+                retryable=True,
+            )
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
         external_id = str(data.get("id")) if data.get("id") else request_id
         self.store.set_phase(task.task_id, TaskPhase.collecting_result)

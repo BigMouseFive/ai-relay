@@ -1,59 +1,38 @@
-# API key 等秘密放入此文件（相对 config.yaml），例如：
-# AI_RELAY_INTERNAL_OPENAI_API_KEY='轮换后的新 key'
+# 可选秘密放入此文件（相对 config.yaml），例如 CURSOR_API_KEY。
+# 默认 ACP 可复用当前用户的 Cursor 登录态，不需要额外 key。
 # 该文件已被 .gitignore 忽略；进程环境变量优先于该文件。
 environment_file: .env
 
 server:
-  host: 127.0.0.1
+  host: 0.0.0.0  # 仅供可信家庭 LAN；路由器不要做公网端口映射
   port: 8600
 
-webbridge:
-  base_url: http://127.0.0.1:10086
-  command_timeout_seconds: 60
-  status_timeout_seconds: 5
+# 默认 ACP-only：不会启动 Kimi WebBridge，不会打开浏览器 tab。
+# 如未来确实要启用 browser target，再显式增加 webbridge 配置和 target。
 
 # 统一执行目标。每个 target 的 count 都是独立并发槽数量。
 # 支持多个同类型 target；id 必须全局唯一。
 targets:
-  # ---- 浏览器 WebBridge ----
-  - id: kimi-browser-fast
-    type: webbridge
-    site: kimi
-    model: "K2.6"
-    count: 3
-
-  - id: deepseek-browser-default
-    type: webbridge
-    site: deepseek
-    model: ""
-    count: 3
-
-  - id: minimax-browser-default
-    type: webbridge
-    site: minimax
-    model: ""
-    count: 3
-
-  # ---- ACP / Cursor agent CLI ----
+  # ---- ACP / Cursor agent CLI（默认）----
   # Cursor Agent CLI 实际非交互命令：
   # agent --print --output-format text --mode ask --workspace <dir> <prompt>
   # ask/plan 都是只读模式；不会开启 --force / --yolo。
-  # - id: cursor-agent-project-a
-  #   type: acp
-  #   command: agent
-  #   args: []
-  #   working_directory: "../your-workspace"
-  #   mode: ask                 # ask | plan
-  #   output_format: text       # text | json | stream-json
-  #   trust_workspace: true
-  #   pass_workspace: true
-  #   # 可选：绕过 Keychain，使用 .env 中的 Cursor API key。
-  #   # api_key_env: CURSOR_API_KEY
-  #   # endpoint: "https://api2.cursor.sh"
-  #   count: 2
-  #   timeout_seconds: 600
-  #   output_max_chars: 200000
-  #   graceful_shutdown_seconds: 5
+  - id: cursor-agent-ai-relay
+    type: acp
+    command: agent
+    args: []
+    working_directory: "."
+    mode: ask                 # ask | plan
+    output_format: text       # text | json | stream-json
+    trust_workspace: true
+    pass_workspace: true
+    # 可选：绕过 Keychain，使用 .env 中的 Cursor API key。
+    # api_key_env: CURSOR_API_KEY
+    # endpoint: "https://api2.cursor.sh"
+    count: 2
+    timeout_seconds: 600
+    output_max_chars: 200000
+    graceful_shutdown_seconds: 5
 
   # 可以配置多个 ACP workspace：
   # - id: cursor-agent-project-b
@@ -72,12 +51,13 @@ targets:
   #   type: openai_compatible
   #   base_url: "http://10.67.8.60:18080/v1"
   #   api_key_env: AI_RELAY_INTERNAL_OPENAI_API_KEY
-  #   model: "gpt-5.6-terra"
+  #   model: "填写 GET /models 当前返回的实际模型 ID"
   #   count: 4
   #   timeout_seconds: 120
   #   max_retries: 2
   #   allow_model_override: false
-  #   max_output_tokens: 4096
+  #   verify_model_on_start: true  # 启动时只读校验 GET /models，模型改名/下线则 target degraded
+  #   max_output_tokens: 8192
 
   # 第二个 API target 可以使用独立模型/并发/key 环境变量：
   # - id: internal-openai-fast
@@ -91,16 +71,18 @@ targets:
   #   allow_model_override: true
   #   allowed_models: ["模型-a", "模型-b"]
 
-# workers 为旧浏览器配置兼容字段。新部署优先使用上方 targets，二者可共存。
+# 旧浏览器配置兼容字段；默认必须为空，避免启动任何浏览器 worker。
 workers: []
 
 task:
   timeout_seconds: 600
   retention_seconds: 3600
   max_prompt_chars: 12000
+  max_response_schema_chars: 30000  # /v1 response_format.schema 序列化后的大小上限
   stall_seconds: 120
   hard_timeout_seconds: 300
-  max_retries: 3
+  max_retries: 3                   # 服务端默认/总上限（首次执行外的安全重试次数）
+  max_client_requested_retries: 3  # 调用方 retry_policy.max_retries 的硬上限
   retry_switch_site: false
   max_queue_wait_seconds: 3600
   retry_initial_delay_seconds: 3
@@ -118,6 +100,11 @@ routing:
   latency_reference_seconds: 60
   failure_penalty: 0.50
   outcome_unknown_penalty: 0.85
+  # Simple Listing 默认只使用 ACP；ERP 不指定 target。
+  task_policies:
+    listing_copy:
+      allowed_targets: [cursor-agent-ai-relay]
+      max_in_flight_per_target: 2
 
 dashboard:
   history_size: 100
@@ -127,9 +114,10 @@ storage:
   terminal_retention_seconds: 2592000
   metadata_retention_seconds: 7776000
 
-erp:
-  register_url: ""
-  node_name: ""
-  advertise_url: ""
-  token: ""
-  interval_seconds: 30
+# 局域网自动发现：ai-relay 只通过 IPv4 mDNS/DNS-SD 公告，不配置 ERP 地址、token 或回调 URL。
+# ERP 宿主机上的 lan-discovery-agent 会自动发现并主动探测服务。
+discovery:
+  enabled: true
+  instance_name: ""               # 空=主机名
+  advertise_address: ""            # 多网卡时填可被 ERP 访问的 IPv4；空=自动探测私有 IPv4
+  identity_path: data/service-identity.json

@@ -9,7 +9,8 @@ import pytest
 
 from app.config import AcpTargetConfig, OpenAICompatibleTargetConfig
 from app.external_workers import (
-    AcpWorker, ExternalOutcomeUnknownError, ExternalResult, OpenAICompatibleWorker,
+    AcpWorker, ApiResponseError, ExternalOutcomeUnknownError, ExternalResult,
+    OpenAICompatibleWorker,
 )
 from app.schemas import BackendType, TaskStatus, WorkerState
 from app.store import TaskStore
@@ -94,6 +95,52 @@ async def test_openai_worker_missing_key_degrades_without_http_call(monkeypatch)
     assert "环境变量未设置" in (worker.detail or "")
 
 
+async def test_openai_model_verification_accepts_published_model(monkeypatch):
+    monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(200, json={"data": [{"id": "available-model"}]})
+
+    target = OpenAICompatibleTargetConfig(
+        id="api-verified", type="openai_compatible", base_url="http://mock.invalid/v1",
+        api_key_env="TEST_OPENAI_KEY", model="available-model", verify_model_on_start=True,
+    )
+    worker = OpenAICompatibleWorker("api-verified-1", target, TaskStore(), 30, _retry)
+    worker._client = httpx.AsyncClient(
+        base_url=target.base_url,
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer not-a-real-key"},
+    )
+    worker._api_key = "not-a-real-key"
+
+    await worker._verify_model_available()
+    await worker.stop()
+
+
+async def test_openai_model_verification_rejects_removed_model(monkeypatch):
+    monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "current-model"}]})
+
+    target = OpenAICompatibleTargetConfig(
+        id="api-stale", type="openai_compatible", base_url="http://mock.invalid/v1",
+        api_key_env="TEST_OPENAI_KEY", model="removed-model", verify_model_on_start=True,
+    )
+    worker = OpenAICompatibleWorker("api-stale-1", target, TaskStore(), 30, _retry)
+    worker._client = httpx.AsyncClient(
+        base_url=target.base_url,
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer not-a-real-key"},
+    )
+    worker._api_key = "not-a-real-key"
+
+    with pytest.raises(Exception, match="API 配置模型不存在: removed-model"):
+        await worker._verify_model_available()
+    await worker.stop()
+
+
 async def test_openai_chat_completions_uses_v1_path_and_task_idempotency(monkeypatch):
     monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
     captured = {}
@@ -132,6 +179,49 @@ async def test_openai_chat_completions_uses_v1_path_and_task_idempotency(monkeyp
     assert captured["auth"] == "Bearer not-a-real-key"
     assert captured["idempotency"] == task.task_id
     assert captured["body"]["model"] == "fake-model"
+
+
+async def test_openai_http_200_missing_content_is_retryable_confirmed_failure(monkeypatch):
+    monkeypatch.setenv("TEST_OPENAI_KEY", "not-a-real-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "chatcmpl-missing-content",
+            "choices": [{
+                "message": {"role": "assistant", "reasoning_content": "thinking only"},
+                "finish_reason": "stop",
+            }],
+        })
+
+    target = OpenAICompatibleTargetConfig(
+        id="api-missing-content", type="openai_compatible",
+        base_url="http://mock.invalid/v1", api_key_env="TEST_OPENAI_KEY",
+        model="fake-model",
+    )
+    store = TaskStore()
+    task = store.create(
+        "hello", None, target_id=target.id,
+        backend_type=BackendType.openai_compatible, model=target.model,
+    )
+    worker = OpenAICompatibleWorker("api-missing-content-1", target, store, 30, _retry)
+    await worker.start()
+    assert worker._client is not None
+    await worker._client.aclose()
+    worker._client = httpx.AsyncClient(
+        base_url=target.base_url,
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer not-a-real-key", "Content-Type": "application/json"},
+    )
+
+    with pytest.raises(ApiResponseError) as exc_info:
+        await worker._execute(task)
+    await worker.stop()
+
+    assert exc_info.value.code == "api_invalid_response"
+    assert exc_info.value.retryable is True
+    attempt = store.get(task.task_id).to_info().attempts
+    # _execute is called directly here, so no attempt row is created by run_task.
+    assert attempt == []
 
 
 async def test_external_worker_cancellation_becomes_cancelled(monkeypatch):
