@@ -73,6 +73,9 @@ class AcpTargetConfig(TargetBaseConfig):
     trust_workspace: bool = True
     pass_workspace: bool = True
     output_max_chars: int = Field(default=200_000, ge=1_000, le=5_000_000)
+    # agent --print 主进程退出后，后台 helper 可能仍继承 stdout/stderr 写端；
+    # 给 pipe 一小段排空时间，仍未 EOF 则清理本次 process group。
+    pipe_drain_after_exit_seconds: float = Field(default=2.0, ge=0, le=60)
     graceful_shutdown_seconds: float = Field(default=5.0, gt=0, le=60)
 
 

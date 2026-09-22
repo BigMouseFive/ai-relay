@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import httpx
 import pytest
@@ -269,3 +270,37 @@ async def test_acp_missing_configured_key_degrades_without_process(tmp_path, mon
     await worker.start()
     assert worker.state == WorkerState.degraded
     assert "环境变量未设置" in (worker.detail or "")
+
+
+async def test_acp_worker_cleans_process_group_after_agent_exits_with_inherited_pipe(tmp_path):
+    script = tmp_path / "fake_agent_with_helper.py"
+    script.write_text(
+        "import os, sys, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    time.sleep(30)\n"
+        "    os._exit(0)\n"
+        "os.write(1, b'answer-from-parent\\n')\n"
+        "os._exit(0)\n",
+        encoding="utf-8",
+    )
+    target = AcpTargetConfig(
+        id="acp-helper", type="acp", command=sys.executable, args=[str(script)],
+        working_directory=str(tmp_path), verify_auth_on_start=False,
+        pipe_drain_after_exit_seconds=0.05, graceful_shutdown_seconds=0.2,
+    )
+    store = TaskStore()
+    task = store.create("hello", None, target_id=target.id, backend_type=BackendType.acp)
+    worker = AcpWorker("acp-helper-1", target, store, 5, _retry)
+    await worker.start()
+    started = asyncio.get_running_loop().time()
+    worker.start_task(task)
+    assert worker._run_task is not None
+    await worker._run_task
+    elapsed = asyncio.get_running_loop().time() - started
+
+    saved = store.get(task.task_id)
+    assert saved is not None
+    assert saved.status == TaskStatus.done, (saved.error_code, saved.error)
+    assert saved.result == "answer-from-parent"
+    assert elapsed < 2.0

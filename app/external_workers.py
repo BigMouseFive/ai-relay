@@ -363,20 +363,22 @@ class AcpWorker(ExternalWorker):
         finally:
             self._active_process = None
         total_elapsed = time.monotonic() - attempt_started
+        process_exit_code = io_metrics.get("process_exit_code", process.returncode)
         logger.info(
-            "任务 %s ACP CLI 子进程结束: pid=%s exit=%s total_elapsed=%.3fs stdout_bytes=%d stderr_bytes=%d stdout_first_after=%s stderr_first_after=%s wait_after_io=%.3fs",
-            task.task_id[:8], process.pid, process.returncode, total_elapsed,
+            "任务 %s ACP CLI 子进程结束: pid=%s exit=%s total_elapsed=%.3fs stdout_bytes=%d stderr_bytes=%d stdout_first_after=%s stderr_first_after=%s process_exit_after=%s process_group_cleaned=%s",
+            task.task_id[:8], process.pid, process_exit_code, total_elapsed,
             len(stdout), len(stderr), io_metrics.get("stdout_first_after"),
-            io_metrics.get("stderr_first_after"), io_metrics.get("wait_after_io", 0.0))
-        if process.returncode != 0:
+            io_metrics.get("stderr_first_after"), io_metrics.get("process_exit_after"),
+            io_metrics.get("process_group_cleaned", False))
+        if process_exit_code != 0:
             detail = stderr.decode("utf-8", errors="replace").strip() or "无 stderr 输出"
-            self.store.update_attempt(task.task_id, process_exit_code=process.returncode)
+            self.store.update_attempt(task.task_id, process_exit_code=process_exit_code)
             # CLI 已启动并接收 prompt 后的非零退出无法证明没有副作用，绝不自动重放。
-            raise ExternalOutcomeUnknownError(f"ACP 退出码 {process.returncode}: {detail}")
+            raise ExternalOutcomeUnknownError(f"ACP 退出码 {process_exit_code}: {detail}")
         text = stdout.decode("utf-8", errors="replace").strip()
         if not text:
             raise AcpExecutionError("ACP 未返回文本结果")
-        return ExternalResult(text=text, process_exit_code=process.returncode)
+        return ExternalResult(text=text, process_exit_code=process_exit_code)
 
     def _build_argv(self, prompt: str) -> list[str]:
         """构建 Cursor Agent CLI 的非交互、只读命令，不经 shell。"""
@@ -408,12 +410,15 @@ class AcpWorker(ExternalWorker):
     async def _communicate_limited(
         self, process: asyncio.subprocess.Process, input_data: Optional[bytes], task_id: str,
     ) -> tuple[bytes, bytes, dict[str, Any]]:
-        """边读边限流，避免无限 stdout/stderr 撑爆 relay 内存。"""
+        """边读边限流，并在主进程退出后清理继承 pipe 的 helper 进程。"""
         started = time.monotonic()
         metrics: dict[str, Any] = {
             "stdout_first_after": None,
             "stderr_first_after": None,
-            "wait_after_io": 0.0,
+            "process_exit_after": None,
+            "process_exit_code": None,
+            "pipe_drain_after_exit": 0.0,
+            "process_group_cleaned": False,
         }
         if input_data is not None and process.stdin:
             process.stdin.write(input_data)
@@ -441,18 +446,47 @@ class AcpWorker(ExternalWorker):
                         task_id[:8], name, time.monotonic() - started, size)
             return b"".join(chunks)
 
+        pgid = process.pid
         readers = [asyncio.create_task(read_limited(process.stdout, "stdout")),
                    asyncio.create_task(read_limited(process.stderr, "stderr"))]
+        wait_task = asyncio.create_task(self._wait_process_exit(process))
         try:
+            process_exit_code = await wait_task
+            metrics["process_exit_after"] = round(time.monotonic() - started, 3)
+            metrics["process_exit_code"] = process_exit_code
+            pipes_open = any(not reader.done() for reader in readers)
+            logger.info(
+                "任务 %s ACP CLI 主进程退出: pid=%s exit=%s after=%.3fs pipes_still_open=%s",
+                task_id[:8], process.pid, process_exit_code,
+                metrics["process_exit_after"], pipes_open)
+            if pipes_open:
+                drain_started = time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(asyncio.gather(*readers)),
+                        timeout=self.target.pipe_drain_after_exit_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    metrics["process_group_cleaned"] = True
+                    metrics["pipe_drain_after_exit"] = round(time.monotonic() - drain_started, 3)
+                    logger.warning(
+                        "任务 %s ACP CLI 主进程已退出但 pipe 未关闭，清理 process group: pgid=%s drain=%.3fs",
+                        task_id[:8], pgid, metrics["pipe_drain_after_exit"])
+                    await self._terminate_process_group(pgid, task_id)
+                # SIGTERM/SIGKILL 之后 pipe 应尽快 EOF；若仍不 EOF，让 attempt 总超时兜底。
             stdout, stderr = await asyncio.gather(*readers)
+            return stdout, stderr, metrics
         except Exception:
             await self._terminate_process(process)
+            if process.returncode is not None:
+                await self._terminate_process_group(pgid, task_id)
             await asyncio.gather(*readers, return_exceptions=True)
             raise
-        wait_started = time.monotonic()
-        await process.wait()
-        metrics["wait_after_io"] = round(time.monotonic() - wait_started, 3)
-        return stdout, stderr, metrics
+        finally:
+            if not wait_task.done():
+                wait_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wait_task
 
     async def _check_cancel(self, task: TaskRecord) -> None:
         current = self.store.get(task.task_id)
@@ -484,6 +518,87 @@ class AcpWorker(ExternalWorker):
                 await process.wait()
         logger.info("ACP CLI 子进程已终止: pid=%s elapsed=%.3fs exit=%s",
                     process.pid, time.monotonic() - started, process.returncode)
+
+    async def _terminate_process_group(self, pgid: int, task_id: str) -> None:
+        if not hasattr(os, "killpg"):
+            return
+        started = time.monotonic()
+        logger.info("任务 %s ACP CLI 清理 process group: pgid=%s graceful_timeout=%.1fs",
+                    task_id[:8], pgid, self.target.graceful_shutdown_seconds)
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except PermissionError as error:
+            logger.warning("任务 %s ACP CLI process group SIGTERM 权限不足: pgid=%s error=%s",
+                           task_id[:8], pgid, error)
+        await asyncio.sleep(0)
+        # 不能等待已退出的主进程；给 helper 一段优雅退出时间，再兜底 SIGKILL。
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._wait_process_group_empty,
+                    pgid,
+                    self.target.graceful_shutdown_seconds,
+                ),
+                timeout=self.target.graceful_shutdown_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("任务 %s ACP CLI process group SIGTERM 超时，发送 SIGKILL: pgid=%s elapsed=%.3fs",
+                           task_id[:8], pgid, time.monotonic() - started)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as error:
+                logger.warning("任务 %s ACP CLI process group SIGKILL 权限不足: pgid=%s error=%s",
+                               task_id[:8], pgid, error)
+        logger.info("任务 %s ACP CLI process group 清理完成: pgid=%s elapsed=%.3fs",
+                    task_id[:8], pgid, time.monotonic() - started)
+
+    async def _wait_process_exit(self, process: asyncio.subprocess.Process) -> int:
+        """Return the main process exit code without waiting for pipe EOF.
+
+        asyncio's Process.wait() may be coupled to subprocess transport cleanup
+        on some platforms. Poll both Process.returncode and waitpid(WNOHANG),
+        tolerating whichever child watcher observes process exit first.
+        """
+        while True:
+            if process.returncode is not None:
+                return int(process.returncode)
+            try:
+                waited_pid, status = os.waitpid(process.pid, os.WNOHANG)
+            except ChildProcessError:
+                if process.returncode is not None:
+                    return int(process.returncode)
+                # Another child watcher has reaped it but returncode has not
+                # propagated yet; yield once and check again.
+                await asyncio.sleep(0.01)
+                if process.returncode is not None:
+                    return int(process.returncode)
+                return 0
+            if waited_pid == process.pid:
+                if os.WIFEXITED(status):
+                    return os.WEXITSTATUS(status)
+                if os.WIFSIGNALED(status):
+                    return 128 + os.WTERMSIG(status)
+                return 255
+            await asyncio.sleep(0.02)
+
+    @staticmethod
+    def _wait_process_group_empty(pgid: int, timeout_seconds: float) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                # The group still exists but cannot be signalled/probed from
+                # this process on the current platform; keep waiting until the
+                # caller's timeout decides whether to escalate.
+                pass
+            time.sleep(0.05)
 
 
 class CursorAcpWorker(ExternalWorker):

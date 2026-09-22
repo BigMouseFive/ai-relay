@@ -31,6 +31,8 @@ targets:
     count: 2
     timeout_seconds: 600
     output_max_chars: 200000
+    # Linux 上 agent --print 可能拉起继承 stdout/stderr 的 helper；主进程退出后短暂排空再清理进程组。
+    pipe_drain_after_exit_seconds: 2
     graceful_shutdown_seconds: 5
 
   # ---- Real Cursor Agent Client Protocol v1 ----
