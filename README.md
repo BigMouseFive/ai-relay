@@ -25,9 +25,14 @@ ERP ──HTTP/mDNS──> ai-relay (FastAPI) ──子进程──> Cursor Agen
 ```bash
 cd ai-relay
 ./install.sh
+
+# 中国大陆网络环境下：使用清华 PyPI 镜像下载 pip 和 Python 依赖
+./install.sh --china-mirror
 ```
 
 脚本自动完成：Python 检查（Ubuntu 自动 apt 安装）→ 创建 `.venv` 安装依赖 → 校验配置 → **注册开机自启** → 启动并健康检查。ACP-only 配置会明确跳过 WebBridge；只有配置了 browser target 才安装/启动它。
+
+`--china-mirror` 使用清华 PyPI 镜像 `https://pypi.tuna.tsinghua.edu.cn/simple` 下载 pip 与 `requirements.txt` 中的 Python 包；它不改变 apt、WebBridge、Cursor Agent 或模型 API 的下载/访问地址。
 
 自启机制使用用户级服务；Ubuntu ACP-only 配合 linger 可在无人登录时开机启动：
 

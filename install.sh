@@ -2,8 +2,9 @@
 # ai-relay 一键安装启动 + 开机自启（macOS / Ubuntu）
 #
 # 用法：
-#   ./install.sh            安装依赖、注册开机自启并立即启动
-#   ./install.sh uninstall  停止服务并移除开机自启（保留代码与 .venv）
+#   ./install.sh                 安装依赖、注册开机自启并立即启动
+#   ./install.sh --china-mirror  使用清华 PyPI 镜像安装 Python 依赖
+#   ./install.sh uninstall       停止服务并移除开机自启（保留代码与 .venv）
 #
 # 说明：
 # - macOS 使用 launchd LaunchAgent（用户登录后自启，KeepAlive 崩溃自动拉起）
@@ -19,6 +20,9 @@ VENV="$PROJECT_DIR/.venv"
 CONFIG="$PROJECT_DIR/config.yaml"
 SERVICE_LABEL="com.ai-relay.server"
 WEBBRIDGE_BIN="$HOME/.kimi-webbridge/bin/kimi-webbridge"
+CHINA_PYPI_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
+USE_CHINA_MIRROR=false
+PIP_INDEX_ARGS=()
 
 log()  { echo -e "\033[1;32m[ai-relay]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[ai-relay 警告]\033[0m $*"; }
@@ -68,8 +72,33 @@ uninstall() {
   exit 0
 }
 
-if [[ "${1:-}" == "uninstall" ]]; then
-  uninstall
+usage() {
+  cat <<EOF
+用法：
+  $0 [--china-mirror]       安装依赖、注册开机自启并立即启动
+  $0 uninstall              停止服务并移除开机自启（保留代码与 .venv）
+
+选项：
+  --china-mirror            使用清华 PyPI 镜像下载 pip / Python 依赖
+  -h, --help                显示本帮助
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --china-mirror) USE_CHINA_MIRROR=true ;;
+    uninstall)
+      [[ "$#" -eq 1 ]] || { err "uninstall 不能与其他参数组合"; usage; exit 2; }
+      uninstall
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "未知参数: $arg"; usage; exit 2 ;;
+  esac
+done
+
+if [[ "$USE_CHINA_MIRROR" == true ]]; then
+  PIP_INDEX_ARGS=(--index-url "$CHINA_PYPI_INDEX")
+  log "Python 依赖将使用清华 PyPI 镜像: $CHINA_PYPI_INDEX"
 fi
 
 # ============ 1. Python 3.11+ ============
@@ -94,8 +123,8 @@ log "Python $(python3 --version | awk '{print $2}') OK"
 # ============ 2. 虚拟环境 + 依赖 ============
 log "准备 Python 虚拟环境 ..."
 [[ -d "$VENV" ]] || python3 -m venv "$VENV"
-"$VENV/bin/pip" install -q --upgrade pip
-"$VENV/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt"
+"$VENV/bin/pip" install -q --upgrade pip "${PIP_INDEX_ARGS[@]}"
+"$VENV/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" "${PIP_INDEX_ARGS[@]}"
 log "依赖安装完成"
 
 ensure_config
