@@ -22,7 +22,6 @@ SERVICE_LABEL="com.ai-relay.server"
 WEBBRIDGE_BIN="$HOME/.kimi-webbridge/bin/kimi-webbridge"
 CHINA_PYPI_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
 USE_CHINA_MIRROR=false
-PIP_INDEX_ARGS=()
 
 log()  { echo -e "\033[1;32m[ai-relay]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[ai-relay 警告]\033[0m $*"; }
@@ -97,7 +96,6 @@ for arg in "$@"; do
 done
 
 if [[ "$USE_CHINA_MIRROR" == true ]]; then
-  PIP_INDEX_ARGS=(--index-url "$CHINA_PYPI_INDEX")
   log "Python 依赖将使用清华 PyPI 镜像: $CHINA_PYPI_INDEX"
 fi
 
@@ -123,8 +121,13 @@ log "Python $(python3 --version | awk '{print $2}') OK"
 # ============ 2. 虚拟环境 + 依赖 ============
 log "准备 Python 虚拟环境 ..."
 [[ -d "$VENV" ]] || python3 -m venv "$VENV"
-"$VENV/bin/pip" install -q --upgrade pip "${PIP_INDEX_ARGS[@]}"
-"$VENV/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" "${PIP_INDEX_ARGS[@]}"
+if [[ "$USE_CHINA_MIRROR" == true ]]; then
+  "$VENV/bin/pip" install -q --upgrade pip --index-url "$CHINA_PYPI_INDEX"
+  "$VENV/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" --index-url "$CHINA_PYPI_INDEX"
+else
+  "$VENV/bin/pip" install -q --upgrade pip
+  "$VENV/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt"
+fi
 log "依赖安装完成"
 
 ensure_config

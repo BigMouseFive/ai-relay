@@ -1,0 +1,62 @@
+server:
+  host: 0.0.0.0
+  port: 8600
+
+# 默认仅使用 ACP，不创建 WebBridge browser worker，也不依赖浏览器扩展。
+workers: []
+
+targets:
+  # Cursor Agent CLI：默认只读 ask 模式；相对目录相对于本 config.yaml 解析。
+  - id: cursor-agent-ai-relay
+    type: acp
+    command: "/Users/wenwendemac/.local/bin/agent"
+    working_directory: "."
+    mode: ask
+    output_format: text
+    trust_workspace: true
+    pass_workspace: true
+    count: 2
+    timeout_seconds: 600
+    output_max_chars: 200000
+
+
+environment_file: .env
+
+task:
+  timeout_seconds: 600      # 单个任务从开始执行到判定完成的最长时间
+  retention_seconds: 3600   # 已完成任务结果保留时长
+  max_prompt_chars: 12000   # 超过则拒绝提交
+  max_response_schema_chars: 30000
+  stall_seconds: 120        # 生成停滞上限：超过该时长回答无进展则重建会话重试（僵尸"正在生成"态）
+  max_retries: 3            # 失败后允许重新入队的次数（总执行次数 = max_retries + 1）
+  max_client_requested_retries: 3
+  hard_timeout_seconds: 300 # 硬超时：不信任 generating，超过即失败并走跨站点重试
+  retry_switch_site: false  # ACP-only：不跨 target/站点切换
+
+queue:
+  max_size: 100             # 排队上限，满了 POST /api/tasks 返回 429
+
+# /v1 未指定 target 时，按近期成功率、结果未知率、耗时与容量自动选择。
+routing:
+  default_mode: adaptive
+  window_seconds: 604800
+  min_samples: 5
+  exploration_weight: 0.08
+  latency_reference_seconds: 60
+  failure_penalty: 0.50
+  outcome_unknown_penalty: 0.85
+  task_policies:
+    # 默认只使用已完成 20/20 验证的 ACP target。
+    listing_copy:
+      allowed_targets: [cursor-agent-ai-relay]
+      max_in_flight_per_target: 2
+
+dashboard:
+  history_size: 100         # 监控页展示的最近任务数
+
+# 局域网 IPv4 mDNS 自动发现；不再配置 ERP 地址/心跳/token。
+discovery:
+  enabled: true
+  instance_name: "amazon"
+  advertise_address: ""   # 空=自动探测本机可用私有 IPv4（本机开发用；home-server 可显式填写固定地址）
+  identity_path: data/service-identity.json
