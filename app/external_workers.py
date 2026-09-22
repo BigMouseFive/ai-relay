@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import signal
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -279,6 +280,10 @@ class AcpWorker(ExternalWorker):
 
     async def _verify_auth(self) -> None:
         """只读预检 Cursor 登录/Keychain 状态；不创建聊天、不提交 prompt。"""
+        started = time.monotonic()
+        logger.info("worker %s ACP CLI 认证预检开始: command=%s timeout=%.1fs",
+                    self.worker_id, self._resolved_command or self.target.command,
+                    self.target.auth_check_timeout_seconds)
         try:
             process = await asyncio.create_subprocess_exec(
                 self._resolved_command or self.target.command, "status", cwd=self._working_directory,
@@ -288,7 +293,13 @@ class AcpWorker(ExternalWorker):
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=self.target.auth_check_timeout_seconds)
         except (OSError, asyncio.TimeoutError) as error:
+            logger.warning("worker %s ACP CLI 认证预检失败，用时 %.3fs: %s",
+                           self.worker_id, time.monotonic() - started, error)
             raise AcpExecutionError(f"ACP 认证预检失败: {error}") from error
+        elapsed = time.monotonic() - started
+        logger.info(
+            "worker %s ACP CLI 认证预检结束: elapsed=%.3fs exit=%s stdout_bytes=%d stderr_bytes=%d",
+            self.worker_id, elapsed, process.returncode, len(stdout), len(stderr))
         if process.returncode != 0:
             detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
             if "keychain is locked" in detail.lower():
@@ -302,13 +313,21 @@ class AcpWorker(ExternalWorker):
 
     async def _execute(self, task: TaskRecord) -> ExternalResult:
         await self._check_cancel(task)
+        attempt_started = time.monotonic()
         self.store.set_phase(task.task_id, TaskPhase.sending)
         self.store.update_attempt(task.task_id, phase=TaskPhase.sending, send_state="sending")
 
-        argv = self._build_argv(task.execution_prompt())
+        prompt = task.execution_prompt()
+        argv = self._build_argv(prompt)
         stdin: Optional[int] = None
         input_data: Optional[bytes] = None
+        safe_argv = [arg if arg != prompt else f"<prompt:{len(prompt)} chars>" for arg in argv]
+        logger.info(
+            "任务 %s ACP CLI 子进程启动准备: worker=%s timeout=%.1fs cwd=%s argv=%s",
+            task.task_id[:8], self.worker_id, self.timeout_seconds, self._working_directory,
+            safe_argv)
 
+        spawn_started = time.monotonic()
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -326,17 +345,29 @@ class AcpWorker(ExternalWorker):
         except OSError as error:
             raise RetryableExternalWorkerError(f"ACP 子进程无法启动: {error}") from error
 
+        spawn_elapsed = time.monotonic() - spawn_started
+        logger.info("任务 %s ACP CLI 子进程已启动: pid=%s spawn_elapsed=%.3fs",
+                    task.task_id[:8], process.pid, spawn_elapsed)
         self._active_process = process
         self.store.set_phase(task.task_id, TaskPhase.generating)
         self.store.update_attempt(task.task_id, phase=TaskPhase.generating,
                                   send_state="sent_confirmed")
         try:
-            stdout, stderr = await self._communicate_limited(process, input_data)
+            stdout, stderr, io_metrics = await self._communicate_limited(
+                process, input_data, task.task_id)
         except asyncio.CancelledError:
+            logger.info("任务 %s ACP CLI 执行被取消，准备终止子进程 pid=%s elapsed=%.3fs",
+                        task.task_id[:8], process.pid, time.monotonic() - attempt_started)
             await self._terminate_process(process)
             raise
         finally:
             self._active_process = None
+        total_elapsed = time.monotonic() - attempt_started
+        logger.info(
+            "任务 %s ACP CLI 子进程结束: pid=%s exit=%s total_elapsed=%.3fs stdout_bytes=%d stderr_bytes=%d stdout_first_after=%s stderr_first_after=%s wait_after_io=%.3fs",
+            task.task_id[:8], process.pid, process.returncode, total_elapsed,
+            len(stdout), len(stderr), io_metrics.get("stdout_first_after"),
+            io_metrics.get("stderr_first_after"), io_metrics.get("wait_after_io", 0.0))
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip() or "无 stderr 输出"
             self.store.update_attempt(task.task_id, process_exit_code=process.returncode)
@@ -374,36 +405,54 @@ class AcpWorker(ExternalWorker):
             env["CURSOR_API_KEY"] = key
         return env
 
-    async def _communicate_limited(self, process: asyncio.subprocess.Process,
-                                   input_data: Optional[bytes]) -> tuple[bytes, bytes]:
+    async def _communicate_limited(
+        self, process: asyncio.subprocess.Process, input_data: Optional[bytes], task_id: str,
+    ) -> tuple[bytes, bytes, dict[str, Any]]:
         """边读边限流，避免无限 stdout/stderr 撑爆 relay 内存。"""
+        started = time.monotonic()
+        metrics: dict[str, Any] = {
+            "stdout_first_after": None,
+            "stderr_first_after": None,
+            "wait_after_io": 0.0,
+        }
         if input_data is not None and process.stdin:
             process.stdin.write(input_data)
             await process.stdin.drain()
             process.stdin.close()
         assert process.stdout is not None and process.stderr is not None
 
-        async def read_limited(stream: asyncio.StreamReader) -> bytes:
+        async def read_limited(stream: asyncio.StreamReader, name: str) -> bytes:
             chunks: list[bytes] = []
             size = 0
+            first_key = f"{name}_first_after"
             while chunk := await stream.read(64 * 1024):
+                now = time.monotonic()
+                if metrics[first_key] is None:
+                    metrics[first_key] = round(now - started, 3)
+                    logger.info(
+                        "任务 %s ACP CLI 首次 %s 输出: after=%.3fs chunk_bytes=%d",
+                        task_id[:8], name, now - started, len(chunk))
                 size += len(chunk)
                 if size > self.target.output_max_chars:
                     raise ExternalOutcomeUnknownError(
                         f"ACP 输出超过上限 {self.target.output_max_chars} 字节，已拒绝保存不完整结果")
                 chunks.append(chunk)
+            logger.info("任务 %s ACP CLI %s 流结束: elapsed=%.3fs bytes=%d",
+                        task_id[:8], name, time.monotonic() - started, size)
             return b"".join(chunks)
 
-        readers = [asyncio.create_task(read_limited(process.stdout)),
-                   asyncio.create_task(read_limited(process.stderr))]
+        readers = [asyncio.create_task(read_limited(process.stdout, "stdout")),
+                   asyncio.create_task(read_limited(process.stderr, "stderr"))]
         try:
             stdout, stderr = await asyncio.gather(*readers)
         except Exception:
             await self._terminate_process(process)
             await asyncio.gather(*readers, return_exceptions=True)
             raise
+        wait_started = time.monotonic()
         await process.wait()
-        return stdout, stderr
+        metrics["wait_after_io"] = round(time.monotonic() - wait_started, 3)
+        return stdout, stderr, metrics
 
     async def _check_cancel(self, task: TaskRecord) -> None:
         current = self.store.get(task.task_id)
@@ -413,6 +462,9 @@ class AcpWorker(ExternalWorker):
     async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
             return
+        started = time.monotonic()
+        logger.info("ACP CLI 终止子进程: pid=%s graceful_timeout=%.1fs",
+                    process.pid, self.target.graceful_shutdown_seconds)
         with suppress(ProcessLookupError):
             if hasattr(os, "killpg"):
                 os.killpg(process.pid, signal.SIGTERM)
@@ -421,6 +473,8 @@ class AcpWorker(ExternalWorker):
         try:
             await asyncio.wait_for(process.wait(), timeout=self.target.graceful_shutdown_seconds)
         except asyncio.TimeoutError:
+            logger.warning("ACP CLI 子进程 SIGTERM 超时，发送 SIGKILL: pid=%s elapsed=%.3fs",
+                           process.pid, time.monotonic() - started)
             with suppress(ProcessLookupError):
                 if hasattr(os, "killpg"):
                     os.killpg(process.pid, signal.SIGKILL)
@@ -428,6 +482,8 @@ class AcpWorker(ExternalWorker):
                     process.kill()
             with suppress(Exception):
                 await process.wait()
+        logger.info("ACP CLI 子进程已终止: pid=%s elapsed=%.3fs exit=%s",
+                    process.pid, time.monotonic() - started, process.returncode)
 
 
 class CursorAcpWorker(ExternalWorker):
