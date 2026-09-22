@@ -1,9 +1,9 @@
 # ai-relay · AI 问答中转站
 
-统一承接 ERP LLM 请求的本地中转服务。默认配置只使用 Cursor Agent CLI 的 ACP target，不安装/启动 Kimi WebBridge，也不会打开浏览器：
+统一承接 ERP LLM 请求的本地中转服务。默认配置只使用兼容的 Cursor Agent CLI target，不安装/启动 Kimi WebBridge，也不会打开浏览器：
 
 ```
-ERP ──HTTP/mDNS──> ai-relay (FastAPI) ──子进程──> Cursor Agent CLI (ACP)
+ERP ──HTTP/mDNS──> ai-relay (FastAPI) ──子进程──> Cursor Agent CLI 或真实 Cursor ACP
 ```
 
 可选扩展为 OpenAI-compatible API 或 Kimi/DeepSeek/MiniMax WebBridge target，但必须显式写入 `config.yaml`。
@@ -17,7 +17,7 @@ ERP ──HTTP/mDNS──> ai-relay (FastAPI) ──子进程──> Cursor Agen
 
 1. **macOS 或 Ubuntu**；默认 ACP-only 可运行在无桌面环境的 home-server
 2. Python 3.11+（Ubuntu 可用 apt 自动装，macOS 建议 `brew install python@3.12`）
-3. Cursor Agent CLI `agent` 已安装并登录；也可在 ACP target 中通过 `api_key_env` 映射 key
+3. Cursor Agent CLI `agent` 已安装并登录；旧 CLI target 和真实 `agent acp` target 都可通过 `api_key_env` 映射 key
 4. 只有显式配置 WebBridge target 时，才需要桌面浏览器、WebBridge 扩展及对应站点登录态
 
 ## 一键安装启动（含开机自启）
@@ -95,10 +95,11 @@ storage:
 
 ### 执行后端：WebBridge、ACP、OpenAI-compatible API
 
-`targets` 支持三种类型：
+`targets` 支持四种类型：
 
 ```yaml
 targets:
+  # 旧 CLI 方式：type: acp，保持现有行为
   - id: cursor-agent-project-a
     type: acp
     command: agent
@@ -106,6 +107,15 @@ targets:
     mode: ask                    # ask | plan；均为只读模式
     output_format: text          # text | json | stream-json
     trust_workspace: true
+    count: 2
+    timeout_seconds: 600
+
+  # 真实 ACP v1：type: cursor_acp，agent acp 通过 stdio JSON-RPC 通信
+  - id: cursor-acp-project-a
+    type: cursor_acp
+    command: agent
+    args: [acp]
+    working_directory: "../project-a"
     count: 2
     timeout_seconds: 600
 
@@ -122,7 +132,9 @@ targets:
     retry_server_errors: false   # 默认：5xx 结果未知，不自动重发
 ```
 
-- **ACP / Cursor Agent CLI**：当前机器已确认 CLI 版本为 `2026.09.10-fd3934a`，非交互命令为 `agent --print --output-format text --mode ask --workspace <dir> <prompt>`。每个并发槽启动独立子进程组，绝不使用 `shell=True`；默认 `ask` / `plan` 都是只读模式，不会传 `--force` 或 `--yolo`；取消时先 SIGTERM 再 SIGKILL，stdout/stderr 有上限。`agent status` 已确认当前用户已登录。若服务环境仍无法使用 Keychain，可在 ACP target 设置 `api_key_env: CURSOR_API_KEY`，relay 只把该变量映射为子进程的 `CURSOR_API_KEY`，不放进进程参数或日志。
+- **旧 Cursor Agent CLI（`type: acp`）**：当前机器已确认非交互命令为 `agent --print --output-format text --mode ask --workspace <dir> <prompt>`。该方式保持兼容；每个并发槽启动独立子进程组，绝不使用 `shell=True`。
+- **真实 Cursor ACP（`type: cursor_acp`）**：每个 worker slot 持有一个长期 `agent acp` stdio JSON-RPC 连接，每个任务调用 `initialize/session/new/session/prompt` 并创建独立 session；通过 `session/update` 收集文本，通过 `session/cancel` 取消。`count: N` 就是 N 条独立 ACP 连接。旧 CLI 和真实 ACP 可以同时配置。
+- 两种 Cursor target 都支持 `api_key_env: CURSOR_API_KEY`；relay 只把该变量映射为子进程环境变量，不放进进程参数或日志。
 - **OpenAI-compatible API**：调用 `{base_url}/chat/completions`，使用 Bearer key 与 relay task ID 作为 `Idempotency-Key`。API key 只从 `api_key_env` 环境变量读取。`base_url` 必须包含版本前缀（如 `/v1`）。建议启用 `verify_model_on_start`：relay 会只读请求 `GET /models`，配置模型已改名/下线时将 target 标记为 degraded，而不是等业务任务收到 5xx。HTTP 200 但缺少/为空的 `message.content` 是确定的不合格响应，可按 relay retry budget 安全重试。
 - `target` 是 `/v1/tasks` 推荐的精确路由字段；指定 target 后不会自动跨到 ACP/API/浏览器的其他 target。
 - 未指定 target 的旧调用只会调度 WebBridge browser target，绝不会意外发送到 ACP 或 API。

@@ -13,11 +13,13 @@ import shutil
 import signal
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import httpx
 
-from .config import AcpTargetConfig, OpenAICompatibleTargetConfig
+from .acp_protocol import AcpConnection, AcpConnectionClosed, AcpProtocolError, AcpRpcError
+from .config import AcpTargetConfig, CursorAcpTargetConfig, OpenAICompatibleTargetConfig
 from .response_contract import ResponseValidationError
 from .schemas import BackendType, TaskPhase, TaskStatus, WorkerState
 from .store import TaskRecord, TaskStore
@@ -426,6 +428,306 @@ class AcpWorker(ExternalWorker):
                     process.kill()
             with suppress(Exception):
                 await process.wait()
+
+
+class CursorAcpWorker(ExternalWorker):
+    """Real Cursor ACP v1 worker.
+
+    Each worker owns one long-lived ``agent acp`` stdio connection. Each relay
+    task gets a fresh ACP session so independent tasks cannot share context.
+    The legacy ``AcpWorker`` above intentionally remains the one-shot Cursor
+    CLI implementation for existing ``type: acp`` configurations.
+    """
+
+    backend_type = BackendType.cursor_acp
+
+    def __init__(self, worker_id: str, target: CursorAcpTargetConfig, store: TaskStore,
+                 default_timeout_seconds: float, on_retry: RetryCallback) -> None:
+        super().__init__(
+            worker_id, target.id, target.model, store,
+            target.timeout_seconds or default_timeout_seconds, on_retry,
+        )
+        self.target = target
+        self._working_directory: Optional[str] = None
+        self._resolved_command: Optional[str] = None
+        self._connection: Optional[AcpConnection] = None
+        self._session_id: Optional[str] = None
+        self._prompt_future: Optional[asyncio.Future[Any]] = None
+        self._prompt_started = False
+        self._response_parts: list[str] = []
+        self._sessions_created = 0
+        self._session_lock = asyncio.Lock()
+
+    def _resolve_command(self) -> str:
+        command = os.path.expanduser(self.target.command)
+        if os.path.isabs(command) or os.sep in command:
+            if os.path.isfile(command) and os.access(command, os.X_OK):
+                return command
+            raise AcpExecutionError(f"Cursor ACP 命令不可执行: {command}")
+        candidates = [
+            shutil.which(command),
+            os.path.expanduser(f"~/.local/bin/{command}"),
+            os.path.expanduser(f"~/.cursor/bin/{command}"),
+            f"/opt/homebrew/bin/{command}",
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        raise AcpExecutionError(
+            f"Cursor ACP 命令不可用: {self.target.command}（可配置绝对路径）")
+
+    async def _validate_ready(self) -> None:
+        self._resolved_command = self._resolve_command()
+        path = os.path.abspath(os.path.expanduser(self.target.working_directory))
+        if not os.path.isdir(path):
+            raise AcpExecutionError(f"Cursor ACP 工作目录不存在: {path}")
+        if self.target.api_key_env and not os.environ.get(self.target.api_key_env):
+            raise AcpExecutionError(
+                f"Cursor ACP API key 环境变量未设置: {self.target.api_key_env}")
+        self._working_directory = path
+        await self._ensure_connection()
+
+    async def _ensure_connection(self) -> AcpConnection:
+        if self._connection and self._connection.is_running:
+            return self._connection
+        if not self._resolved_command or not self._working_directory:
+            raise AcpExecutionError("Cursor ACP worker 尚未完成本地配置检查")
+        if self._connection:
+            await self._connection.close()
+        connection = AcpConnection(
+            [self._resolved_command, *self.target.args],
+            cwd=self._working_directory,
+            env=self._child_env(),
+            output_max_chars=self.target.output_max_chars,
+            graceful_shutdown_seconds=self.target.graceful_shutdown_seconds,
+            request_handler=self._handle_agent_request,
+            notification_handler=self._handle_notification,
+        )
+        try:
+            await connection.start()
+            await asyncio.wait_for(
+                connection.initialize(protocol_version=self.target.protocol_version),
+                timeout=self.target.initialize_timeout_seconds,
+            )
+        except Exception:
+            await connection.close()
+            raise
+        self._connection = connection
+        self._sessions_created = 0
+        logger.info(
+            "worker %s 已建立 Cursor ACP 连接（agent=%s）",
+            self.worker_id, connection.agent_info.get("name", "unknown"),
+        )
+        return connection
+
+    async def stop(self) -> None:
+        if self._connection and self._session_id:
+            with suppress(Exception):
+                await self._cancel_session()
+        await super().stop()
+        if self._connection:
+            await self._connection.close()
+            self._connection = None
+        self._session_id = None
+
+    async def _execute(self, task: TaskRecord) -> ExternalResult:
+        await self._check_cancel(task)
+        connection = await self._ensure_connection()
+        async with self._session_lock:
+            self._response_parts = []
+            self._prompt_started = False
+            self.store.set_phase(task.task_id, TaskPhase.sending)
+            self.store.update_attempt(
+                task.task_id, phase=TaskPhase.sending, send_state="sending")
+            try:
+                session = await connection.request(
+                    "session/new", {"cwd": self._working_directory, "mcpServers": []},
+                    timeout=self.target.request_timeout_seconds,
+                )
+                if not isinstance(session, dict) or not isinstance(session.get("sessionId"), str):
+                    raise AcpExecutionError("Cursor ACP session/new 返回缺少 sessionId")
+                self._session_id = session["sessionId"]
+                self._sessions_created += 1
+                self.store.update_attempt(
+                    task.task_id, external_request_id=self._session_id,
+                )
+                await self._check_cancel(task)
+                prompt_future = await connection.begin_request(
+                    "session/prompt",
+                    {
+                        "sessionId": self._session_id,
+                        "prompt": [{"type": "text", "text": task.execution_prompt()}],
+                    },
+                )
+                self._prompt_future = prompt_future
+                self._prompt_started = True
+                self.store.set_phase(task.task_id, TaskPhase.generating)
+                self.store.update_attempt(
+                    task.task_id, phase=TaskPhase.generating,
+                    send_state="sent_confirmed",
+                )
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(prompt_future),
+                        timeout=self.target.request_timeout_seconds,
+                    )
+                except asyncio.TimeoutError as error:
+                    raise ExternalOutcomeUnknownError(
+                        "Cursor ACP session/prompt 响应超时，结果未知") from error
+            except asyncio.CancelledError:
+                await self._cancel_session()
+                raise
+            except AcpRpcError as error:
+                if error.code == -32800:
+                    raise ExternalTaskCancelledError("Cursor ACP prompt 已取消") from error
+                if self._prompt_started:
+                    raise ExternalOutcomeUnknownError(str(error)) from error
+                raise AcpExecutionError(str(error)) from error
+            except AcpConnectionClosed as error:
+                if self._prompt_started:
+                    raise ExternalOutcomeUnknownError(str(error)) from error
+                raise RetryableExternalWorkerError(str(error)) from error
+            except AcpProtocolError as error:
+                if self._prompt_started:
+                    raise ExternalOutcomeUnknownError(str(error)) from error
+                raise RetryableExternalWorkerError(str(error)) from error
+            finally:
+                self._prompt_future = None
+                session_id = self._session_id
+                self._session_id = None
+                if session_id:
+                    await self._finish_session(connection, session_id)
+
+            if not isinstance(result, dict):
+                raise AcpExecutionError("Cursor ACP session/prompt 返回格式无效")
+            stop_reason = result.get("stopReason")
+            if stop_reason == "cancelled":
+                raise ExternalTaskCancelledError("Cursor ACP prompt 已取消")
+            if stop_reason not in {"end_turn", "max_tokens", "max_turn_requests"}:
+                raise AcpExecutionError(
+                    f"Cursor ACP prompt 未正常结束: {stop_reason or 'unknown'}")
+            text = "".join(self._response_parts).strip()
+            if not text:
+                raise AcpExecutionError("Cursor ACP 未返回文本结果")
+            self.store.set_phase(task.task_id, TaskPhase.collecting_result)
+            return ExternalResult(text=text, external_request_id=session_id)
+
+    async def _finish_session(self, connection: AcpConnection, session_id: str) -> None:
+        capabilities = connection.agent_capabilities or {}
+        session_caps = capabilities.get("sessionCapabilities") or {}
+        can_close = "close" in session_caps or "close" in capabilities
+        if can_close and connection.is_running:
+            with suppress(Exception):
+                await connection.request(
+                    "session/close", {"sessionId": session_id},
+                    timeout=self.target.session_close_timeout_seconds,
+                )
+        if (
+            not can_close
+            and self._sessions_created >= self.target.max_sessions_per_connection
+        ):
+            await connection.close()
+            if self._connection is connection:
+                self._connection = None
+            self._sessions_created = 0
+
+    async def _cancel_session(self) -> None:
+        connection = self._connection
+        session_id = self._session_id
+        if not connection or not session_id or not connection.is_running:
+            return
+        with suppress(Exception):
+            await connection.notify("session/cancel", {"sessionId": session_id})
+        if self._prompt_future and not self._prompt_future.done():
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(self._prompt_future), timeout=5.0)
+
+    async def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
+        if method != "session/update":
+            return
+        if self._session_id and params.get("sessionId") != self._session_id:
+            return
+        update = params.get("update") or {}
+        if not isinstance(update, dict):
+            return
+        kind = update.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            text = self._text_from_content(update.get("content"))
+            if text:
+                self._response_parts.append(text)
+        elif kind in {"tool_call", "tool_call_update", "plan"}:
+            logger.debug("Cursor ACP %s update: %s", kind, update.get("toolCallId", "-"))
+
+    async def _handle_agent_request(self, method: str, params: dict[str, Any]) -> Any:
+        if method == "session/request_permission":
+            options = params.get("options") or []
+            reject = next(
+                (item for item in options
+                 if isinstance(item, dict) and item.get("kind") == "reject_once"),
+                None,
+            )
+            if reject and reject.get("optionId"):
+                return {"outcome": {"outcome": "selected", "optionId": reject["optionId"]}}
+            return {"outcome": {"outcome": "cancelled"}}
+        if method == "fs/read_text_file":
+            return await self._read_workspace_file(params)
+        raise AcpRpcError(-32601, f"ai-relay 不支持 ACP 请求: {method}")
+
+    async def _read_workspace_file(self, params: dict[str, Any]) -> dict[str, str]:
+        if not self._working_directory:
+            raise AcpRpcError(-32603, "工作目录尚未初始化")
+        raw_path = params.get("path")
+        if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
+            raise AcpRpcError(-32602, "fs/read_text_file.path 必须是绝对路径")
+        try:
+            path = Path(raw_path).expanduser().resolve()
+            root = Path(self._working_directory).resolve()
+            path.relative_to(root)
+        except (OSError, ValueError) as error:
+            raise AcpRpcError(-32602, "只能读取工作目录内的文件") from error
+        if not path.is_file():
+            raise AcpRpcError(-32000, f"文件不存在: {path}")
+        try:
+            content = await asyncio.to_thread(path.read_text, encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise AcpRpcError(-32000, f"读取文件失败: {error}") from error
+        line = params.get("line")
+        limit = params.get("limit")
+        if isinstance(line, int) and line > 1 or isinstance(limit, int) and limit >= 0:
+            lines = content.splitlines(keepends=True)
+            start = max(0, line - 1) if isinstance(line, int) and line > 0 else 0
+            end = start + limit if isinstance(limit, int) and limit >= 0 else None
+            content = "".join(lines[start:end])
+        if len(content) > self.target.output_max_chars:
+            raise AcpRpcError(-32000, "文件内容超过 relay 输出上限")
+        return {"content": content}
+
+    def _child_env(self) -> dict[str, str]:
+        env = {
+            key: value for key, value in os.environ.items()
+            if key in {"HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"}
+        }
+        if self.target.api_key_env:
+            key = os.environ.get(self.target.api_key_env)
+            if not key:
+                raise AcpExecutionError(
+                    f"Cursor ACP API key 环境变量未设置: {self.target.api_key_env}")
+            env["CURSOR_API_KEY"] = key
+        return env
+
+    async def _check_cancel(self, task: TaskRecord) -> None:
+        current = self.store.get(task.task_id)
+        if current and current.cancel_requested:
+            raise ExternalTaskCancelledError("任务已请求取消")
+
+    @staticmethod
+    def _text_from_content(content: Any) -> str:
+        if isinstance(content, dict):
+            return content.get("text", "") if content.get("type") == "text" else ""
+        if isinstance(content, list):
+            return "".join(CursorAcpWorker._text_from_content(item) for item in content)
+        return content if isinstance(content, str) else ""
 
 
 class OpenAICompatibleWorker(ExternalWorker):

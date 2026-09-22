@@ -60,7 +60,10 @@ class WorkerState(str, Enum):
 
 class BackendType(str, Enum):
     webbridge = "webbridge"
+    # Legacy one-shot Cursor CLI integration.
     acp = "acp"
+    # Real Cursor Agent Client Protocol v1 integration.
+    cursor_acp = "cursor_acp"
     openai_compatible = "openai_compatible"
 
 

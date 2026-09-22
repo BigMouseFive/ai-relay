@@ -218,6 +218,7 @@ const stateText = s => ({idle:'空闲', busy:'忙碌', degraded:'异常', starti
 const siteText = s => s || '任意';
 const fmtSecs = s => s == null ? '-' : (s < 60 ? s.toFixed(0) + 's' : (s/60).toFixed(1) + 'min');
 const fmtDateTime = seconds => seconds == null ? '-' : new Date(seconds * 1000).toLocaleString('zh-CN', {hour12:false});
+const durationBetween = (start, end) => start == null ? null : Math.max(0, (end == null ? Date.now() / 1000 : end) - start);
 const taskStateText = s => ({queued:'排队中',retry_wait:'等待重试',running:'执行中',done:'完成',failed:'失败',cancelled:'已取消',expired:'排队超时',interrupted:'服务中断',outcome_unknown:'结果未知'}[s] || s);
 const backendMeta = type => ({
   webbridge: {name:'浏览器 WebBridge', icon:'◉'},
@@ -460,18 +461,40 @@ const detailCache = new Map();
 function fillDetail(exp, t) {
   const pres = exp.querySelectorAll('pre');
   pres[0].textContent = t.prompt || '';
+  const endedAt = t.finished_at || Date.now() / 1000;
+  const queueWait = t.started_at == null ? null : durationBetween(t.created_at, t.started_at);
+  const execution = durationBetween(t.started_at, endedAt);
+  const total = durationBetween(t.created_at, endedAt);
   const lines = [
     `状态：${taskStateText(t.status)} / ${t.phase || '-'}`,
-    `创建时间：${fmtDateTime(t.created_at)}`,
+    '',
+    '时间分解',
+    `  创建：${fmtDateTime(t.created_at)}`,
+    `  开始：${fmtDateTime(t.started_at)}`,
+    `  结束：${fmtDateTime(t.finished_at)}`,
+    `  排队等待：${queueWait == null ? '尚未开始执行' : fmtSecs(queueWait)}`,
+    `  执行耗时：${fmtSecs(execution)}`,
+    `  总耗时：${fmtSecs(total)}`,
+    '',
     `请求目标：${t.target_id || t.site || '任意浏览器'}；实际目标：${t.actual_target_id || t.actual_site || '-'}`,
     `后端：${t.actual_backend_type || t.backend_type || '-'}；路由：${t.routing_mode || '-'}`,
     t.routing_decision ? `自动选择权重：${t.routing_decision.selection_weight ?? '-'}` : '',
     `重试：${t.retries || 0}；错误类别：${t.error_code || '-'}`,
     `尝试站点：${(t.tried_sites || []).join(' → ') || '-'}`,
   ];
+  const attempts = t.attempts || [];
+  if (attempts.length) {
+    lines.push('', '尝试明细');
+    attempts.forEach((attempt, index) => {
+      const target = attempt.target_id || attempt.site || '-';
+      const attemptEnd = attempt.finished_at ?? (terminal(t.status) ? null : endedAt);
+      const attemptDuration = attemptEnd == null ? null : durationBetween(attempt.started_at, attemptEnd);
+      lines.push(`  #${index + 1} ${target} · ${attempt.backend_type || '-'} · ${fmtSecs(attemptDuration)}${attempt.error_code ? ` · ${attempt.error_code}` : ''}`);
+    });
+  }
   if (t.result) lines.push('', '结果：', t.result);
   if (t.error) lines.push('', '错误：', t.error);
-  pres[1].textContent = lines.join('\n');
+  pres[1].textContent = lines.filter(Boolean).join('\n');
 }
 
 function applyExpanded() {

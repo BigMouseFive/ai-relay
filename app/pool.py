@@ -12,10 +12,12 @@ from typing import Any, Callable, Optional
 from . import db as task_db
 from .adaptive_router import AdaptiveRouter
 from .config import (
-    AcpTargetConfig, Config, OpenAICompatibleTargetConfig, TargetConfig,
-    TaskRoutingPolicy, WebbridgeTargetConfig,
+    AcpTargetConfig, Config, CursorAcpTargetConfig, OpenAICompatibleTargetConfig,
+    TargetConfig, TaskRoutingPolicy, WebbridgeTargetConfig,
 )
-from .external_workers import AcpWorker, ExternalWorker, OpenAICompatibleWorker
+from .external_workers import (
+    AcpWorker, CursorAcpWorker, ExternalWorker, OpenAICompatibleWorker,
+)
 from .schemas import BackendType, TaskSummary, WorkerInfo, WorkerState
 from .sites import create_adapter
 from .sites.base import SiteAdapter
@@ -92,8 +94,15 @@ class WorkerPool:
                         tab_group_title=config.webbridge.tab_group_title,
                     )
                 elif isinstance(target, AcpTargetConfig):
+                    # Backward-compatible one-shot Cursor CLI worker.
                     worker = AcpWorker(
                         worker_id=f"acp-{target.id}-{slot}", target=target, store=store,
+                        default_timeout_seconds=config.task.timeout_seconds,
+                        on_retry=self._on_retry_needed,
+                    )
+                elif isinstance(target, CursorAcpTargetConfig):
+                    worker = CursorAcpWorker(
+                        worker_id=f"cursor-acp-{target.id}-{slot}", target=target, store=store,
                         default_timeout_seconds=config.task.timeout_seconds,
                         on_retry=self._on_retry_needed,
                     )

@@ -13,10 +13,9 @@ server:
 # 统一执行目标。每个 target 的 count 都是独立并发槽数量。
 # 支持多个同类型 target；id 必须全局唯一。
 targets:
-  # ---- ACP / Cursor agent CLI（默认）----
-  # Cursor Agent CLI 实际非交互命令：
-  # agent --print --output-format text --mode ask --workspace <dir> <prompt>
-  # ask/plan 都是只读模式；不会开启 --force / --yolo。
+  # ---- Legacy Cursor agent CLI（默认，保持兼容）----
+  # 实际非交互命令：agent --print --output-format text --mode ask --workspace <dir> <prompt>
+  # type: acp 仍然表示此 CLI 方式，不是 ACP JSON-RPC。
   - id: cursor-agent-ai-relay
     type: acp
     command: agent
@@ -34,14 +33,16 @@ targets:
     output_max_chars: 200000
     graceful_shutdown_seconds: 5
 
-  # 可以配置多个 ACP workspace：
-  # - id: cursor-agent-project-b
-  #   type: acp
+  # ---- Real Cursor Agent Client Protocol v1 ----
+  # 一个 worker slot 对应一个长期 agent acp 进程/stdio 连接；每个任务创建独立 session。
+  # - id: cursor-acp-project-b
+  #   type: cursor_acp
   #   command: agent
+  #   args: [acp]
   #   working_directory: "../another-workspace"
-  #   mode: plan
-  #   output_format: text
   #   count: 1
+  #   timeout_seconds: 600
+  #   max_sessions_per_connection: 50
 
   # ---- OpenAI-compatible API ----
   # API key 只能从环境变量读取，绝不能写入 config.yaml 或提交到仓库。

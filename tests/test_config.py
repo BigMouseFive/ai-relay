@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import Config, load_config
+from app.config import Config, CursorAcpTargetConfig, load_config
 from app.instance_lock import InstanceAlreadyRunning, InstanceLock
 
 
@@ -55,10 +55,13 @@ def test_multiple_targets_and_legacy_workers_are_normalized():
             {"id": "api-one", "type": "openai_compatible", "base_url": "http://api.invalid/v1", "api_key_env": "KEY_ONE", "model": "m1", "count": 2},
             {"id": "api-two", "type": "openai_compatible", "base_url": "http://api.invalid/v1", "api_key_env": "KEY_TWO", "model": "m2", "count": 3},
             {"id": "acp-one", "type": "acp", "working_directory": ".", "count": 2},
+            {"id": "cursor-acp-one", "type": "cursor_acp", "working_directory": ".", "count": 2},
         ],
     })
     assert [target.id for target in config.targets] == [
-        "api-one", "api-two", "acp-one", "legacy-webbridge-kimi-1"]
+        "api-one", "api-two", "acp-one", "cursor-acp-one", "legacy-webbridge-kimi-1"]
+    assert isinstance(config.targets[3], CursorAcpTargetConfig)
+    assert config.targets[3].args == ["acp"]
 
 
 def test_duplicate_target_ids_are_rejected():

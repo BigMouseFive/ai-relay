@@ -51,11 +51,10 @@ class WebbridgeTargetConfig(TargetBaseConfig):
 
 
 class AcpTargetConfig(TargetBaseConfig):
-    """Cursor Agent CLI 执行目标（type 保留为 acp 以兼容 relay 路由语义）。
+    """Legacy Cursor Agent CLI target.
 
-    当前 Cursor CLI 的非交互形式是：
-    ``agent --print --output-format text --mode ask --workspace <dir> <prompt>``。
-    prompt 是位置参数，不使用 shell 拼接；默认 ask 模式为只读问答。
+    ``type: acp`` is retained for compatibility and intentionally means the
+    existing one-shot ``agent --print`` integration, not ACP JSON-RPC.
     """
 
     type: Literal["acp"]
@@ -75,6 +74,28 @@ class AcpTargetConfig(TargetBaseConfig):
     pass_workspace: bool = True
     output_max_chars: int = Field(default=200_000, ge=1_000, le=5_000_000)
     graceful_shutdown_seconds: float = Field(default=5.0, gt=0, le=60)
+
+
+class CursorAcpTargetConfig(TargetBaseConfig):
+    """Real Cursor Agent Client Protocol v1 stdio target."""
+
+    type: Literal["cursor_acp"]
+    command: str = "agent"
+    args: list[str] = Field(default_factory=lambda: ["acp"])
+    working_directory: str
+    # ACP v1 does not define a model field on session/new; this value is kept
+    # as worker metadata for compatibility but is not sent as a fake CLI flag.
+    model: str = ""
+    api_key_env: Optional[str] = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    protocol_version: int = Field(default=1, ge=1)
+    initialize_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+    request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    output_max_chars: int = Field(default=200_000, ge=1_000, le=5_000_000)
+    graceful_shutdown_seconds: float = Field(default=5.0, gt=0, le=60)
+    # If session/close is not supported, recycle the connection periodically
+    # so abandoned sessions cannot grow without bound.
+    max_sessions_per_connection: int = Field(default=50, ge=1, le=10_000)
+    session_close_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
 
 
 class OpenAICompatibleTargetConfig(TargetBaseConfig):
@@ -100,7 +121,7 @@ class OpenAICompatibleTargetConfig(TargetBaseConfig):
 
 
 TargetConfig = Annotated[
-    Union[WebbridgeTargetConfig, AcpTargetConfig, OpenAICompatibleTargetConfig],
+    Union[WebbridgeTargetConfig, AcpTargetConfig, CursorAcpTargetConfig, OpenAICompatibleTargetConfig],
     Field(discriminator="type"),
 ]
 
@@ -284,6 +305,6 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         raise ValueError("至少需要配置一个 target 或 workers")
     # ACP 相对工作目录与配置文件绑定，而不是依赖服务管理器的 WorkingDirectory。
     for target in config.targets:
-        if isinstance(target, AcpTargetConfig) and not Path(target.working_directory).is_absolute():
+        if isinstance(target, (AcpTargetConfig, CursorAcpTargetConfig)) and not Path(target.working_directory).is_absolute():
             target.working_directory = str((config_path.parent / target.working_directory).resolve())
     return config
