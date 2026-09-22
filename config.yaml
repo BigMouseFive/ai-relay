@@ -9,7 +9,7 @@ targets:
   # Cursor Agent CLI：默认只读 ask 模式；相对目录相对于本 config.yaml 解析。
   - id: cursor-agent-ai-relay
     type: acp
-    command: "/Users/wenwendemac/.local/bin/agent"
+    command: "agent"
     working_directory: "."
     mode: ask
     output_format: text
